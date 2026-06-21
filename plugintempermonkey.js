@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.4.1
-// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、草稿保护与 Token 预算
+// @version      0.4.2
+// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、草稿保护与严格 Token 预算
 // @match        https://chat.mufy.ai/create*
 // @grant        none
 // ==/UserScript==
@@ -27,8 +27,8 @@
     V0.3.0 工作台外壳沿用，V0.2.2 写入逻辑完全未改动。
   */
 
-  /* ─── 关键字段关键词（用于 Token 合计统计） ─── */
-  var TRACKED_KEYWORDS = ['人设', '角色设定', '开场设计', '输出设定', '情节设定', '样例对话', '文风'];
+  /* ─── Mufy 核心字段（Token 合计只统计这五项） ─── */
+  var TRACKED_FIELD_LABELS = ['人设', '开场设计', '输出设定', '情节设定', '样例对话&文风'];
   var TOKEN_LIMIT = 20090;
 
   /* ─── 全局状态 ─── */
@@ -157,10 +157,40 @@
     return cjkCount + Math.ceil(nonCjk / 4);
   }
 
+  function normalizeTrackedLabel(label) {
+    return compactText(label).replace(/[＆﹠]/g, '&');
+  }
+
   function isTrackedLabel(label) {
-    return TRACKED_KEYWORDS.some(function (kw) {
-      return label.indexOf(kw) !== -1;
+    var normalized = normalizeTrackedLabel(label);
+    return TRACKED_FIELD_LABELS.some(function (expected) {
+      return normalized === normalizeTrackedLabel(expected);
     });
+  }
+
+  function getTrackedFieldByLabel(expectedLabel) {
+    var expected = normalizeTrackedLabel(expectedLabel);
+    for (var i = 0; i < fields.length; i += 1) {
+      var field = fields[i];
+      if (normalizeTrackedLabel(field.label) === expected || normalizeTrackedLabel(field.rawLabel) === expected) {
+        return field;
+      }
+    }
+    return null;
+  }
+
+  function getWbSnapshotByFieldId(fieldId) {
+    for (var i = 0; i < wbSnapshot.length; i += 1) {
+      if (wbSnapshot[i].fieldId === fieldId) return wbSnapshot[i];
+    }
+    return null;
+  }
+
+  function getTrackedFieldContent(field) {
+    var snap = getWbSnapshotByFieldId(field.id);
+    if (snap) return snap.draftContent;
+    if (!field.el || !field.el.isConnected) return null;
+    return getValue(field.el);
   }
 
   function escapeHtml(value) {
@@ -625,7 +655,7 @@
       '      <span id="mufy-wb-token-delta" class="wb-info-val">—</span>',
       '    </div>',
       '    <div class="wb-divider"></div>',
-      '    <div class="wb-section-title">本次已选关键字段合计</div>',
+      '    <div class="wb-section-title">Mufy 核心字段 Token（5项）</div>',
       '    <div id="mufy-wb-tracked-list"></div>',
       '    <div class="wb-divider"></div>',
       '    <div class="wb-info-row wb-total-row">',
@@ -638,7 +668,7 @@
       '    <div id="mufy-wb-limit-label">/ ' + TOKEN_LIMIT + ' Token</div>',
       '    <div class="wb-divider"></div>',
       '    <div class="wb-library-note">',
-      '      ⚠️ 若启用资料库，额外占用约 5000 Token，请自行计入上限。',
+      '      ⚠️ 若此卡包含资料库，请手动额外预留约 5000 Token；本计数不自动加入。',
       '    </div>',
       '  </div>',
       '</div>'
@@ -710,6 +740,7 @@
     wbSnapshot = enabled.map(function (field) {
       var content = getValue(field.el);
       return {
+        fieldId: field.id,
         label: field.label,
         originalContent: content,
         draftContent: content
@@ -822,28 +853,40 @@
       deltaEl.style.color = '#fca5a5';
     }
 
-    // 关键字段合计：遍历快照，找到标签匹配关键词的字段
+    // Mufy 核心字段 Token：只统计五个固定字段。
+    // 已进入工作台的字段使用草稿；未勾选但已扫描的字段读取 Mufy 当前内容。
     var trackedListEl = wbEl.querySelector('#mufy-wb-tracked-list');
     trackedListEl.innerHTML = '';
     var total = 0;
+    var missingLabels = [];
 
-    wbSnapshot.forEach(function (s, idx) {
-      if (!isTrackedLabel(s.label)) return;
-      // 当前正在编辑的字段用编辑器实时值，其余用各自的 draftContent
-      var content = (idx === wbCurrentIndex)
-        ? editor.value
-        : s.draftContent;
-      var t = estimateTokens(content);
-      total += t;
+    TRACKED_FIELD_LABELS.forEach(function (label) {
+      var field = getTrackedFieldByLabel(label);
+      var content = field ? getTrackedFieldContent(field) : null;
+      var tokens = 0;
+
+      if (content === null) {
+        missingLabels.push(label);
+      } else {
+        tokens = estimateTokens(content);
+        total += tokens;
+      }
 
       var row = document.createElement('div');
       row.className = 'wb-info-row wb-tracked-row';
       row.innerHTML =
-        '<span class="wb-info-key wb-tracked-label" title="' + escapeHtml(s.label) + '">' +
-        escapeHtml(s.label) + '</span>' +
-        '<span class="wb-info-val">' + t + '</span>';
+        '<span class="wb-info-key wb-tracked-label" title="' + escapeHtml(label) + '">' +
+        escapeHtml(label) + '</span>' +
+        '<span class="wb-info-val">' + (content === null ? '未扫描' : tokens) + '</span>';
       trackedListEl.appendChild(row);
     });
+
+    if (missingLabels.length) {
+      var missingRow = document.createElement('div');
+      missingRow.style.cssText = 'font-size:10px;line-height:1.5;color:#fbbf24;margin-top:2px';
+      missingRow.textContent = '缺少 ' + missingLabels.length + ' 项：展开对应区块后重新扫描';
+      trackedListEl.appendChild(missingRow);
+    }
 
     wbEl.querySelector('#mufy-wb-total-token').textContent = total + ' / ' + TOKEN_LIMIT + ' token';
 
