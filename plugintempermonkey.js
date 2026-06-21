@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.5.1
-// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、草稿层与单字段手动注入
+// @version      0.5.2
+// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、三态草稿层与单字段手动注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
 // ==/UserScript==
@@ -14,7 +14,7 @@
     V0.5.0 新增：单字段手动注入 Mufy（步骤 3）
     - 编辑器下方新增"写入当前字段到 Mufy"按钮。
     - 写入前检查 el.isConnected，失败给明确提示（已卸载 / 写入失败 / 校验不一致）。
-    - 写入成功后 originalContent 更新为 draftContent，hasDirtyWbDrafts 随之更新。
+    - 写入成功后 syncedContent 更新为 draftContent，entryContent 保持不变。
     - wbSnapshot 每条增加 syncStatus：clean / dirty / synced / failed / stale。
     - 左侧字段列表显示彩色圆点反映同步状态。
     - 切换字段时自动恢复该字段的写入状态提示。
@@ -49,7 +49,7 @@
   // 工作台状态
   var wbEl = null;
   var wbCurrentIndex = -1;
-  // wbSnapshot 条目：{ label, originalContent, draftContent }
+  // wbSnapshot 条目：{ label, entryContent, syncedContent, draftContent, syncStatus, fieldId }
   var wbSnapshot = [];
   // 右侧 Token 面板防抖计时器，避免超长字段每次按键都全量重算。
   var wbTokenTimer = null;
@@ -636,7 +636,7 @@
       '<div id="mufy-wb-topbar">',
       '  <button id="mufy-wb-exit">← 退出工作台</button>',
       '  <button id="mufy-wb-copy-llm" class="secondary">复制给 LLM</button>',
-      '  <button id="mufy-wb-restore" class="secondary">恢复初始版本</button>',
+      '  <button id="mufy-wb-restore" class="secondary">还原草稿至同步版本</button>',
       '  <button id="mufy-wb-discard" class="secondary">放弃草稿</button>',
       '  <span id="mufy-wb-title" class="wb-title">工作台</span>',
       '</div>',
@@ -713,26 +713,26 @@
       });
     });
 
-    /* 恢复初始版本：draft → original，清除同步状态 */
+    /* 还原草稿至当前同步版本：draft → syncedContent，不修改 Mufy 页面 */
     wbEl.querySelector('#mufy-wb-restore').addEventListener('click', function () {
       if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return;
       var snap = wbSnapshot[wbCurrentIndex];
-      snap.draftContent = snap.originalContent;
+      snap.draftContent = snap.syncedContent;
       snap.syncStatus = 'clean';
-      wbEl.querySelector('#mufy-wb-editor').value = snap.originalContent;
+      wbEl.querySelector('#mufy-wb-editor').value = snap.syncedContent;
       setWbWriteStatus('', '');
       renderWbFieldList();
       updateWbRightPanel();
       toast('已恢复"' + snap.label + '"的初始内容');
     });
 
-    /* 放弃草稿：效果同恢复初始版本（步骤 6 引入 LLM 回填后两者语义会分化） */
+    /* 放弃草稿：draft → syncedContent（V0.6.2 引入 LLM 回填后两者语义会分化） */
     wbEl.querySelector('#mufy-wb-discard').addEventListener('click', function () {
       if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return;
       var snap = wbSnapshot[wbCurrentIndex];
-      snap.draftContent = snap.originalContent;
+      snap.draftContent = snap.syncedContent;
       snap.syncStatus = 'clean';
-      wbEl.querySelector('#mufy-wb-editor').value = snap.originalContent;
+      wbEl.querySelector('#mufy-wb-editor').value = snap.syncedContent;
       setWbWriteStatus('', '');
       renderWbFieldList();
       updateWbRightPanel();
@@ -750,7 +750,7 @@
         var snap = wbSnapshot[wbCurrentIndex];
         snap.draftContent = wbEl.querySelector('#mufy-wb-editor').value;
 
-        var isDirty = snap.draftContent !== snap.originalContent;
+        var isDirty = snap.draftContent !== snap.syncedContent;
         var prevStatus = snap.syncStatus;
 
         if (isDirty && prevStatus !== 'dirty') {
@@ -773,14 +773,15 @@
       toast('当前没有勾选字段，请先在面板里勾选要编辑的字段');
       return;
     }
-    // 快照：originalContent 为进入时的原文；draftContent 初始与原文相同
+    // 快照：entryContent 为进入时原文（只读）；syncedContent 为当前同步基线；draftContent 为工作台草稿
     wbSnapshot = enabled.map(function (field) {
       var content = getValue(field.el);
       return {
         fieldId: field.id,
         label: field.label,
-        originalContent: content,
-        draftContent: content,
+        entryContent: content,    // 进入工作台时的原文，只读，不随写入更新
+        syncedContent: content,   // 最近一次成功写入并校验的内容
+        draftContent: content,    // 工作台当前草稿
         // syncStatus: clean | dirty | synced | failed | stale
         syncStatus: 'clean'
       };
@@ -793,7 +794,7 @@
 
   function hasDirtyWbDrafts() {
     return wbSnapshot.some(function (snap) {
-      return snap.draftContent !== snap.originalContent;
+      return snap.draftContent !== snap.syncedContent;
     });
   }
 
@@ -846,7 +847,7 @@
       // 校验是否真的写进去了
       var written = getValue(field.el);
       if (written === snap.draftContent) {
-        snap.originalContent = snap.draftContent;  // Mufy 已同步，更新基线
+        snap.syncedContent = snap.draftContent;  // 更新同步基线；entryContent 保持进入时原文不变
         snap.syncStatus = 'synced';
         setWbWriteStatus('ok', '已同步到 Mufy ✓');
       } else {
@@ -1003,7 +1004,7 @@
     var snap = wbSnapshot[wbCurrentIndex];
     var currentField = findField(snap.fieldId);
     var currentNative = readNativeToken(currentField);
-    var draftChanged = snap.draftContent !== snap.originalContent;
+    var draftChanged = snap.draftContent !== snap.syncedContent;
 
     wbEl.querySelector('#mufy-wb-orig-token').textContent =
       currentNative === null ? '未读取' : currentNative + ' token';
@@ -1513,7 +1514,7 @@
         wbLastWriteUndo &&
         wbLastWriteUndo.fieldId === snap.fieldId &&
         snap.syncStatus === 'synced' &&
-        snap.draftContent === snap.originalContent
+        snap.draftContent === snap.syncedContent
       );
 
       undoButton.disabled = !canUndo;
@@ -1619,7 +1620,7 @@
     }
 
     var pageValueBeforeWrite = getValue(field.el);
-    var originalBeforeWrite = snap.originalContent;
+    var syncedBeforeWrite = snap.syncedContent;  // 保存写入前的同步基线，供撤销恢复
     var expectedValue = snap.draftContent;
 
     wbWritePending = true;
@@ -1655,10 +1656,10 @@
         wbLastWriteUndo = {
           fieldId: snap.fieldId,
           pageValueBeforeWrite: pageValueBeforeWrite,
-          originalBeforeWrite: originalBeforeWrite
+          syncedBeforeWrite: syncedBeforeWrite  // 撤销时 syncedContent 回退到此值
         };
 
-        snap.originalContent = expectedValue;
+        snap.syncedContent = expectedValue;  // 更新同步基线
         snap.draftContent = expectedValue;
         snap.syncStatus = 'synced';
 
@@ -1688,7 +1689,7 @@
       !undo ||
       undo.fieldId !== snap.fieldId ||
       snap.syncStatus !== 'synced' ||
-      snap.draftContent !== snap.originalContent
+      snap.draftContent !== snap.syncedContent
     ) {
       setWbWriteStatus('warn', '当前字段没有可安全撤销的写入');
       updateWbWriteControlsV051();
@@ -1733,8 +1734,8 @@
         snap.syncStatus = 'stale';
         setWbWriteStatus('err', '字段在撤销校验时已卸载，请重新扫描');
       } else if (getValue(field.el) === undo.pageValueBeforeWrite) {
-        snap.originalContent = undo.originalBeforeWrite;
-        snap.syncStatus = snap.draftContent === snap.originalContent
+        snap.syncedContent = undo.syncedBeforeWrite;  // 回退同步基线；entryContent 不变
+        snap.syncStatus = snap.draftContent === snap.syncedContent
           ? 'clean'
           : 'dirty';
 
