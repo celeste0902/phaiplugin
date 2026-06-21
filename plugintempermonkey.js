@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         白厨Mufy字段编辑器
 // @namespace    mufy-card-helper
-// @version      0.5.21
+// @version      0.5.22
 // @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含物品聚合工作台、三态草稿层与安全单字段注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
@@ -11,6 +11,12 @@
   'use strict';
 
   /*
+    V0.5.22 工作台编辑位置记忆
+    - 普通字段记住工作台内的滚动位置与光标选区。
+    - 交互提示词和每条使用后文案分别记住滚动位置与光标选区。
+    - 收起、切字段、切交互、切预览后回到原编辑位置。
+    - 仅在当前页面会话内有效，不影响 Mufy 原生页面，不跨刷新保存。
+
     V0.5.15 专注编辑模式 + Mufy 手动回填复制流
     - 新增 wbFocusMode / wbClipboardTarget 全局状态。
     - 工作台顶栏新增"⛶ 专注编辑"按钮：隐藏左右栏，中区占满宽度（mufy-wb-focus class）。
@@ -356,6 +362,106 @@
       text: '≈' + estimated + ' tk',
       title: '本地估算，等待 Mufy 官方 token'
     };
+  }
+
+  function createEditorViewState() {
+    return { scrollTop: 0, selectionStart: 0, selectionEnd: 0 };
+  }
+
+  function readEditorViewState(editor) {
+    if (!editor) return createEditorViewState();
+    return {
+      scrollTop: editor.scrollTop || 0,
+      selectionStart: typeof editor.selectionStart === 'number' ? editor.selectionStart : 0,
+      selectionEnd: typeof editor.selectionEnd === 'number' ? editor.selectionEnd : 0
+    };
+  }
+
+  function restoreEditorViewState(editor, state) {
+    if (!editor) return;
+    editor.focus();
+    if (!state) {
+      editor.scrollTop = 0;
+      return;
+    }
+    window.requestAnimationFrame(function () {
+      var len = editor.value.length;
+      var start = Math.min(state.selectionStart || 0, len);
+      var end = Math.min(state.selectionEnd || start, len);
+      editor.scrollTop = state.scrollTop || 0;
+      if (typeof editor.setSelectionRange === 'function') {
+        editor.setSelectionRange(start, end);
+      }
+    });
+  }
+
+  function cloneIxnEditorTarget(target) {
+    if (!target) return null;
+    return {
+      kind: target.kind,
+      copywritingIndex: target.copywritingIndex == null ? null : target.copywritingIndex
+    };
+  }
+
+  function ensureIxnEditorViewState(snap) {
+    if (!snap.editorViewState) {
+      snap.editorViewState = {
+        prompt: createEditorViewState(),
+        afterCopywriting: {},
+        activeTarget: { kind: 'prompt', copywritingIndex: null }
+      };
+    }
+    if (!snap.editorViewState.prompt) snap.editorViewState.prompt = createEditorViewState();
+    if (!snap.editorViewState.afterCopywriting) snap.editorViewState.afterCopywriting = {};
+    if (!snap.editorViewState.activeTarget) {
+      snap.editorViewState.activeTarget = { kind: 'prompt', copywritingIndex: null };
+    }
+    return snap.editorViewState;
+  }
+
+  function getIxnTargetViewState(snap, target) {
+    var state = ensureIxnEditorViewState(snap);
+    var t = target || wbCurrentInteractionEditorTarget || state.activeTarget;
+    if (!t || t.kind === 'prompt') return state.prompt;
+    if (t.kind === 'afterCopywriting' && t.copywritingIndex != null) {
+      if (!state.afterCopywriting[t.copywritingIndex]) {
+        state.afterCopywriting[t.copywritingIndex] = createEditorViewState();
+      }
+      return state.afterCopywriting[t.copywritingIndex];
+    }
+    return state.prompt;
+  }
+
+  function setIxnTargetViewState(snap, target, viewState) {
+    var state = ensureIxnEditorViewState(snap);
+    var t = target || wbCurrentInteractionEditorTarget || state.activeTarget;
+    if (!t || t.kind === 'prompt') {
+      state.prompt = viewState;
+      return;
+    }
+    if (t.kind === 'afterCopywriting' && t.copywritingIndex != null) {
+      state.afterCopywriting[t.copywritingIndex] = viewState;
+    }
+  }
+
+  function saveNormalEditorSessionState() {
+    if (!wbEl || wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return;
+    var editor = wbEl.querySelector('#mufy-wb-editor');
+    if (!editor) return;
+    var snap = wbSnapshot[wbCurrentIndex];
+    snap.draftContent = editor.value;
+    snap.viewState = readEditorViewState(editor);
+  }
+
+  function saveCurrentIxnEditorSessionState() {
+    if (!wbEl || !wbCurrentInteraction) return;
+    var snap = getCurrentIxnSnap();
+    if (!snap || !wbCurrentInteractionEditorTarget) return;
+    var editor = wbEl.querySelector('#mufy-ixn-main-editor');
+    if (!editor) return;
+    flushIxnEditorToDraft(snap);
+    setIxnTargetViewState(snap, wbCurrentInteractionEditorTarget, readEditorViewState(editor));
+    ensureIxnEditorViewState(snap).activeTarget = cloneIxnEditorTarget(wbCurrentInteractionEditorTarget);
   }
 
   function normalizeTrackedLabel(label) {
@@ -832,6 +938,11 @@
         captureState: captureState,
         syncStatus: 'clean',
         exportEnabled: false,
+        editorViewState: {
+          prompt: createEditorViewState(),
+          afterCopywriting: {},
+          activeTarget: { kind: 'prompt', copywritingIndex: null }
+        },
         capturedAt: Date.now()
       };
     } else {
@@ -876,6 +987,11 @@
       updateInteractionHud();
       renderList();
       if (wbEl && wbEl.classList.contains('open')) {
+        if (wbCurrentInteraction &&
+            wbCurrentInteraction.itemKey === snap.itemKey &&
+            wbCurrentInteraction.interactionKey === snap.interactionKey) {
+          saveCurrentIxnEditorSessionState();
+        }
         renderWbFieldList();
         if (wbCurrentInteraction &&
             wbCurrentInteraction.itemKey === snap.itemKey &&
@@ -922,6 +1038,11 @@
         updateInteractionHud();
         renderList();
         if (saved && wbEl && wbEl.classList.contains('open')) {
+          if (wbCurrentInteraction &&
+              wbCurrentInteraction.itemKey === saved.itemKey &&
+              wbCurrentInteraction.interactionKey === saved.interactionKey) {
+            saveCurrentIxnEditorSessionState();
+          }
           renderWbFieldList();
           if (wbCurrentInteraction &&
               wbCurrentInteraction.itemKey === saved.itemKey &&
@@ -1545,8 +1666,17 @@
       /* 删除文案 */
       var delSpan = e.target.closest('.mufy-ixn-tab-del');
       if (delSpan) {
+        saveCurrentIxnEditorSessionState();
         var delIdx = parseInt(delSpan.dataset.delIndex, 10);
         snap.draftData.afterCopywriting.splice(delIdx, 1);
+        var viewState = ensureIxnEditorViewState(snap);
+        var nextAfterState = {};
+        Object.keys(viewState.afterCopywriting).forEach(function (key) {
+          var oldIdx = parseInt(key, 10);
+          if (oldIdx < delIdx) nextAfterState[oldIdx] = viewState.afterCopywriting[oldIdx];
+          else if (oldIdx > delIdx) nextAfterState[oldIdx - 1] = viewState.afterCopywriting[oldIdx];
+        });
+        viewState.afterCopywriting = nextAfterState;
         markIxnDirty(snap);
         /* 决定切换到哪个 tab */
         var cur = wbCurrentInteractionEditorTarget;
@@ -1558,6 +1688,7 @@
             wbCurrentInteractionEditorTarget = { kind: 'afterCopywriting', copywritingIndex: Math.min(next, snap.draftData.afterCopywriting.length - 1) };
           }
         }
+        ensureIxnEditorViewState(snap).activeTarget = cloneIxnEditorTarget(wbCurrentInteractionEditorTarget);
         renderIxnTabBar(snap);
         loadIxnMainEditor(snap);
         return;
@@ -1565,27 +1696,28 @@
 
       /* 新增文案 */
       if (e.target.closest('.mufy-ixn-tab-add')) {
-        flushIxnEditorToDraft(snap);
+        saveCurrentIxnEditorSessionState();
         snap.draftData.afterCopywriting.push('');
         markIxnDirty(snap);
         var newIdx = snap.draftData.afterCopywriting.length - 1;
         wbCurrentInteractionEditorTarget = { kind: 'afterCopywriting', copywritingIndex: newIdx };
+        ensureIxnEditorViewState(snap).afterCopywriting[newIdx] = createEditorViewState();
+        ensureIxnEditorViewState(snap).activeTarget = cloneIxnEditorTarget(wbCurrentInteractionEditorTarget);
         renderIxnTabBar(snap);
         loadIxnMainEditor(snap);
-        wbEl.querySelector('#mufy-ixn-main-editor').focus();
         return;
       }
 
       /* 切换 tab */
       var tab = e.target.closest('.mufy-ixn-tab');
       if (tab) {
-        flushIxnEditorToDraft(snap);
+        saveCurrentIxnEditorSessionState();
         var kind = tab.dataset.kind;
         var idx = kind === 'afterCopywriting' ? parseInt(tab.dataset.index, 10) : null;
         wbCurrentInteractionEditorTarget = { kind: kind, copywritingIndex: idx };
+        ensureIxnEditorViewState(snap).activeTarget = cloneIxnEditorTarget(wbCurrentInteractionEditorTarget);
         renderIxnTabBar(snap);
         loadIxnMainEditor(snap);
-        wbEl.querySelector('#mufy-ixn-main-editor').focus();
       }
     });
 
@@ -1781,6 +1913,7 @@
         entryContent: content,    // 进入工作台时的原文，只读，不随写入更新
         syncedContent: content,   // 最近一次成功写入并校验的内容
         draftContent: content,    // 工作台当前草稿
+        viewState: createEditorViewState(),
         // syncStatus: clean | dirty | synced | failed | stale
         syncStatus: 'clean'
       };
@@ -2029,11 +2162,12 @@
   }
 
   function closeWorkbench() {
-    var editor = wbEl && wbEl.querySelector('#mufy-wb-editor');
-    if (editor && !wbCurrentInteraction && wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
-      wbSnapshot[wbCurrentIndex].draftContent = editor.value;
+    if (wbCurrentInteraction) {
+      saveCurrentIxnEditorSessionState();
+      flushInteractionFormToDraft();
+    } else {
+      saveNormalEditorSessionState();
     }
-    if (wbCurrentInteraction) flushInteractionFormToDraft();
     clearWbTokenTimer();
     wbEl.classList.remove('open');
   }
@@ -2184,6 +2318,7 @@
     var prevBtn = wbEl.querySelector('#mufy-wb-mode-preview');
     if (!editorEl || !previewEl) return;
     if (mode === 'preview') {
+      saveNormalEditorSessionState();
       var snap = (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) ? wbSnapshot[wbCurrentIndex] : null;
       renderSafeMarkdown(snap ? snap.draftContent : editorEl.value, previewEl);
       editorEl.style.display = 'none';
@@ -2195,6 +2330,8 @@
       previewEl.style.display = 'none';
       if (editBtn) editBtn.classList.add('active');
       if (prevBtn) prevBtn.classList.remove('active');
+      var normalSnap = (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) ? wbSnapshot[wbCurrentIndex] : null;
+      restoreEditorViewState(editorEl, normalSnap ? normalSnap.viewState : null);
     }
   }
 
@@ -2208,6 +2345,7 @@
     var prevBtn = wbEl.querySelector('#mufy-ixn-mode-preview');
     if (!editorEl || !previewEl) return;
     if (mode === 'preview') {
+      saveCurrentIxnEditorSessionState();
       renderSafeMarkdown(editorEl.value, previewEl);
       editorEl.style.display = 'none';
       previewEl.style.display = '';
@@ -2218,6 +2356,8 @@
       previewEl.style.display = 'none';
       if (editBtn) editBtn.classList.add('active');
       if (prevBtn) prevBtn.classList.remove('active');
+      var ixnSnap = getCurrentIxnSnap();
+      restoreEditorViewState(editorEl, ixnSnap ? getIxnTargetViewState(ixnSnap) : null);
     }
   }
 
@@ -2519,6 +2659,7 @@
       editor.value = (snap.draftData.afterCopywriting || [])[t.copywritingIndex] || '';
       editor.placeholder = '文案 ' + (t.copywritingIndex + 1) + ' 内容…';
     }
+    restoreEditorViewState(editor, getIxnTargetViewState(snap, t));
   }
 
   function getCurrentIxnEditorText(snap) {
@@ -2666,9 +2807,17 @@
     form.querySelector('#mufy-ixn-name').value = dd.interactionName || '';
     form.querySelector('#mufy-ixn-after-action').checked = !!dd.afterAction;
     /* 默认进入提示词 tab */
+    var viewState = ensureIxnEditorViewState(snap);
     if (!wbCurrentInteractionEditorTarget) {
-      wbCurrentInteractionEditorTarget = { kind: 'prompt', copywritingIndex: null };
+      wbCurrentInteractionEditorTarget = cloneIxnEditorTarget(viewState.activeTarget) || { kind: 'prompt', copywritingIndex: null };
     }
+    if (wbCurrentInteractionEditorTarget.kind === 'afterCopywriting') {
+      var idx = wbCurrentInteractionEditorTarget.copywritingIndex;
+      if (idx == null || idx < 0 || idx >= (dd.afterCopywriting || []).length) {
+        wbCurrentInteractionEditorTarget = { kind: 'prompt', copywritingIndex: null };
+      }
+    }
+    viewState.activeTarget = cloneIxnEditorTarget(wbCurrentInteractionEditorTarget);
     renderIxnTabBar(snap);
     loadIxnMainEditor(snap);
 
@@ -2686,14 +2835,18 @@
     if (!wbEl) return;
     // Flush current state before switching
     if (wbCurrentInteraction) {
+      saveCurrentIxnEditorSessionState();
       flushInteractionFormToDraft();
     } else if (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
-      var editor = wbEl.querySelector('#mufy-wb-editor');
-      if (editor) wbSnapshot[wbCurrentIndex].draftContent = editor.value;
+      saveNormalEditorSessionState();
     }
 
     wbCurrentInteraction = { itemKey: itemKey, interactionKey: interactionKey };
-    wbCurrentInteractionEditorTarget = null;  // 重置至默认 tab（提示词）
+    var nextSnap = getCurrentIxnSnap();
+    var nextViewState = nextSnap ? ensureIxnEditorViewState(nextSnap) : null;
+    wbCurrentInteractionEditorTarget = nextViewState ?
+      cloneIxnEditorTarget(nextViewState.activeTarget) :
+      { kind: 'prompt', copywritingIndex: null };
     wbItemExpanded[itemKey] = true;
 
     renderWbFieldList();
@@ -3112,10 +3265,11 @@
 
     // 切换前保存当前状态
     if (wbCurrentInteraction) {
+      saveCurrentIxnEditorSessionState();
       flushInteractionFormToDraft();
       wbCurrentInteraction = null;
     } else if (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
-      wbSnapshot[wbCurrentIndex].draftContent = editor.value;
+      saveNormalEditorSessionState();
     }
 
     showNormalEditor();
@@ -3151,7 +3305,7 @@
     updateWbRightPanel();
     renderItemContextTabs();
     updateWbWriteControls();
-    editor.focus();
+    restoreEditorViewState(editor, snap.viewState);
   }
 
   function updateWbRightPanel() {
@@ -3813,7 +3967,7 @@
     if (!listEl) return;
 
     var title = panelEl ? panelEl.querySelector('#mufy-helper-header span') : null;
-    if (title) title.textContent = '🧩 白厨Mufy字段编辑器 V0.5.21';
+    if (title) title.textContent = '🧩 白厨Mufy字段编辑器 V0.5.22';
 
     listEl.innerHTML = '';
 
@@ -3868,7 +4022,7 @@
     panelEl.id = 'mufy-helper-panel';
     panelEl.innerHTML = [
       '<div id="mufy-helper-header">',
-      '<span class="mufy-panel-title">白厨Mufy字段编辑器 V0.5.21</span>',
+      '<span class="mufy-panel-title">白厨Mufy字段编辑器 V0.5.22</span>',
       '<button class="mufy-panel-help-btn" id="mufy-panel-help" title="帮助">?</button>',
       '<span class="close">✕</span>',
       '</div>',
