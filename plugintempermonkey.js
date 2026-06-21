@@ -784,6 +784,7 @@
         draftData: cloneIxnData(data),
         captureState: captureState,
         syncStatus: 'clean',
+        exportEnabled: false,
         capturedAt: Date.now()
       };
     } else {
@@ -1038,27 +1039,49 @@
     if (interactionHudEl) interactionHudEl.style.display = 'none';
   }
 
-  function buildInteractionMarkdown() {
-    var itemKeys = Object.keys(interactionSnapshotsByItemKey);
-    if (!itemKeys.length) return '';
+  function getEnabledInteractions() {
+    var selected = [];
+    Object.keys(interactionSnapshotsByItemKey).forEach(function (itemKey) {
+      var interactions = interactionSnapshotsByItemKey[itemKey];
+      Object.keys(interactions).forEach(function (interactionKey) {
+        var snap = interactions[interactionKey];
+        if (snap && snap.exportEnabled === true) selected.push(snap);
+      });
+    });
+    return selected;
+  }
+
+  function buildInteractionMarkdown(selectedInteractions) {
+    if (!selectedInteractions || !selectedInteractions.length) return '';
 
     var lines = [
       '',
       '---',
       '',
-      '# 已采集物品交互（只读上下文｜当前版本不支持自动回填交互弹窗）',
+      '# 已选物品交互（手动回填模块）',
+      '',
+      '以下交互为本次主动勾选的模块。',
+      '可以用于参考或协助修改。',
+      '',
+      '插件不会自动回填交互弹窗。',
+      '如需使用 AI 改写后的内容，请在工作台中手动粘贴，',
+      '再复制到 Mufy 对应交互窗并点击保存。',
       ''
     ];
 
-    itemKeys.forEach(function (itemKey) {
-      var interactions = interactionSnapshotsByItemKey[itemKey];
-      var keys = Object.keys(interactions);
-      if (!keys.length) return;
+    var byItem = {};
+    selectedInteractions.forEach(function (snap) {
+      var itemKey = snap.itemKey || '未命名物品';
+      if (!byItem[itemKey]) byItem[itemKey] = [];
+      byItem[itemKey].push(snap);
+    });
+
+    Object.keys(byItem).forEach(function (itemKey) {
       lines.push('## ' + itemKey);
       lines.push('');
-      keys.forEach(function (ik) {
-        var snap = interactions[ik];
-        var sd = snap.syncedData;
+      byItem[itemKey].forEach(function (snap) {
+        var sd = snap.syncedData || snap.draftData || {};
+        var ik = snap.interactionKey || sd.interactionName || '未命名交互';
         lines.push('### 交互｜' + (sd.interactionName || ik));
         lines.push('');
         lines.push('#### 提示词');
@@ -1159,7 +1182,7 @@
     return fields.filter(function (f) { return f.enabled; });
   }
 
-  // 导出范围：当前勾选字段，仅影响"复制已选字段给 AI"
+  // 导出范围：当前勾选普通字段与交互，仅影响"复制已选内容给 AI"
   function getExportFields() {
     return getEnabledFields();
   }
@@ -1254,11 +1277,12 @@
 
   function buildMarkdown() {
     var selected = getExportFields();
-    var header = '以下是本次已选中的角色卡字段（格式：## 字段名）。\n\n';
+    var selectedInteractions = getEnabledInteractions();
+    var header = selected.length ? '以下是本次已选中的角色卡字段（格式：## 字段名）。\n\n' : '';
     var body = selected.map(function (field) {
       return '## ' + field.label + '\n\n' + getValue(field.el) + '\n';
     }).join('\n');
-    return header + body + buildInteractionMarkdown();
+    return header + body + buildInteractionMarkdown(selectedInteractions);
   }
 
   /* ─── 全屏工作台 ─── */
@@ -2303,7 +2327,7 @@
           '',
           '1. 点击右下角悬浮按钮打开面板',
           '2. 点击**扫描 / 刷新**读取当前 Mufy 编辑页的所有字段',
-          '3. 勾选要发给 AI 的字段，点击**复制已选字段给 AI**，将内容发送给 AI 修改',
+          '3. 勾选要发给 AI 的普通字段或交互，点击**复制已选内容给 AI**，将内容发送给 AI 修改',
           '4. 把 AI 返回的文本自行复制，进入工作台，选择对应字段，直接粘贴到编辑区后检查、修改',
           '5. 点击**回填到 Mufy 编辑页**，再在 Mufy 点击"更新角色"保存',
           '',
@@ -3300,6 +3324,7 @@
       '.mufy-item-interaction-header{display:flex;align-items:center;gap:7px;margin-bottom:4px}',
       '.mufy-item-interaction-label{flex:1;font-size:11px;color:#9e96d5}',
       '.mufy-item-interaction-row{padding:4px 0 2px;border-top:1px solid #26233a}',
+      '.mufy-interaction-row-head{display:flex;align-items:center;gap:6px}',
       '.mufy-interaction-name{font-size:11px;color:#cbc6e7;margin-right:6px}',
       '.mufy-interaction-state-observed{font-size:10px;color:#fbbf24}',
       '.mufy-interaction-state-saved{font-size:10px;color:#4ade80}',
@@ -3554,10 +3579,22 @@
     };
   }
 
+  function getItemInteractionExportSelection(snapList) {
+    var enabled = snapList.filter(function (snap) {
+      return snap.exportEnabled === true;
+    }).length;
+
+    return {
+      all: snapList.length > 0 && enabled === snapList.length,
+      mixed: enabled > 0 && enabled < snapList.length
+    };
+  }
+
   function renderInteractionSection(entity) {
     var snaps = interactionSnapshotsByItemKey[entity.itemKey] || {};
     var snapList = Object.keys(snaps).map(function (k) { return snaps[k]; });
     var count = snapList.length;
+    var exportSelection = getItemInteractionExportSelection(snapList);
 
     var section = document.createElement('div');
     section.className = 'mufy-item-interaction-section';
@@ -3565,9 +3602,22 @@
     var header = document.createElement('div');
     header.className = 'mufy-item-interaction-header';
 
+    var exportToggle = document.createElement('input');
+    exportToggle.type = 'checkbox';
+    exportToggle.checked = exportSelection.all;
+    exportToggle.indeterminate = exportSelection.mixed;
+    exportToggle.disabled = count === 0;
+    exportToggle.title = '勾选或取消勾选该物品下全部已采集交互的导出状态';
+    exportToggle.addEventListener('change', function () {
+      snapList.forEach(function (snap) {
+        snap.exportEnabled = exportToggle.checked;
+      });
+      renderList();
+    });
+
     var label = document.createElement('span');
     label.className = 'mufy-item-interaction-label';
-    label.textContent = '交互：已采集 ' + count + ' 项';
+    label.textContent = '交互导出 · 已采集 ' + count + ' 项';
 
     var isActiveSession = interactionCaptureSession &&
       interactionCaptureSession.itemKey === entity.itemKey;
@@ -3587,6 +3637,7 @@
       });
     }
 
+    header.appendChild(exportToggle);
     header.appendChild(label);
     header.appendChild(captureBtn);
 
@@ -3612,9 +3663,33 @@
       var stateText = snap.captureState === 'saved' ? '已保存' : '已读取';
       var stateClass = snap.captureState === 'saved' ? 'mufy-interaction-state-saved' : 'mufy-interaction-state-observed';
 
-      row.innerHTML =
-        '<span class="mufy-interaction-name">▾ ' + escapeHtml(sd.interactionName || snap.interactionKey || '（未命名）') + '</span>' +
-        '<span class="' + stateClass + '">' + stateText + '</span>';
+      var rowHead = document.createElement('div');
+      rowHead.className = 'mufy-interaction-row-head';
+
+      var rowCheckbox = document.createElement('input');
+      rowCheckbox.type = 'checkbox';
+      rowCheckbox.checked = snap.exportEnabled === true;
+      rowCheckbox.title = '是否将该交互复制给 AI';
+      rowCheckbox.addEventListener('click', function (event) {
+        event.stopPropagation();
+      });
+      rowCheckbox.addEventListener('change', function () {
+        snap.exportEnabled = rowCheckbox.checked;
+        renderList();
+      });
+
+      var name = document.createElement('span');
+      name.className = 'mufy-interaction-name';
+      name.textContent = '▾ ' + (sd.interactionName || snap.interactionKey || '（未命名）');
+
+      var state = document.createElement('span');
+      state.className = stateClass;
+      state.textContent = stateText;
+
+      rowHead.appendChild(rowCheckbox);
+      rowHead.appendChild(name);
+      rowHead.appendChild(state);
+      row.appendChild(rowHead);
 
       var detail = document.createElement('div');
       detail.className = 'mufy-interaction-detail';
@@ -3672,7 +3747,7 @@
 
     var summary = document.createElement('span');
     summary.className = 'mufy-item-card-summary';
-    summary.textContent = '基础字段 ' + entity.fields.length + ' 项';
+    summary.textContent = '导出基础字段 · ' + entity.fields.length + ' 项';
 
     var expanded = !!itemListExpanded[entity.itemKey];
     var toggle = document.createElement('button');
@@ -3708,7 +3783,7 @@
     if (!listEl) return;
 
     var title = panelEl ? panelEl.querySelector('#mufy-helper-header span') : null;
-    if (title) title.textContent = '🧩 白厨Mufy字段编辑器 V0.5.19';
+    if (title) title.textContent = '🧩 白厨Mufy字段编辑器 V0.5.20';
 
     listEl.innerHTML = '';
 
@@ -3769,11 +3844,11 @@
       '</div>',
       '<div id="mufy-helper-toolbar">',
       '<button data-act="scan">扫描 / 刷新</button>',
-      '<button data-act="copy">复制已选字段给 AI</button>',
+      '<button data-act="copy">复制已选内容给 AI</button>',
       '<button data-act="workbench">进入工作台</button>',
       '<button class="secondary" id="mufy-helper-select-all">全选导出字段</button>',
       '</div>',
-      '<div class="mufy-export-hint">导出范围：勾选仅影响"复制已选字段给 AI"，不影响工作台。</div>',
+      '<div class="mufy-export-hint">导出范围：勾选决定复制给 AI 的普通字段与交互模块，不影响工作台。</div>',
       '<div id="mufy-helper-list"></div>'
     ].join('');
 
@@ -3803,14 +3878,15 @@
     panelEl.querySelector('[data-act="copy"]').addEventListener('click', function () {
       if (!fields.length) { scanFields(); renderList(); }
       var selected = getExportFields();
-      if (!selected.length) { toast('当前没有勾选字段，先勾选要导出给 AI 的字段'); return; }
+      var selectedInteractions = getEnabledInteractions();
+      if (!selected.length && !selectedInteractions.length) { toast('当前没有勾选内容，先勾选要导出给 AI 的普通字段或交互'); return; }
       var unsafe = getUnsafeEnabledFields();
       if (unsafe.length) { toast('有 ' + unsafe.length + ' 个未确认字段已勾选，请先改名、重绑或取消勾选'); return; }
       var duplicateLabels = getDuplicateEnabledLabels();
       if (duplicateLabels.length) { toast('已选字段有重名标题：' + duplicateLabels.join('、') + '；请先改成不同标题'); return; }
       copyText(buildMarkdown()).then(function (ok) {
         toast(ok
-          ? '已复制选中字段，可直接发送给 AI。\nAI 返回后，请在工作台中手动粘贴到对应字段。'
+          ? '已复制选中内容，可直接发送给 AI。\nAI 返回后，请在工作台中手动粘贴到对应字段或交互。'
           : '复制失败，请手动选择文本复制');
       });
     });
