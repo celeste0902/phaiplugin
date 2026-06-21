@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Mufy 角色卡编辑助手
+// @name         白厨Mufy字段编辑器
 // @namespace    mufy-card-helper
-// @version      0.5.18
+// @version      0.5.19
 // @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含物品聚合工作台、三态草稿层与安全单字段注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
@@ -28,6 +28,18 @@
     - interactionSnapshotsByItemKey 快照升级为三态模型：entryData / syncedData / draftData + syncStatus。
     - 新增 wbCurrentInteraction：工作台当前选中的交互（{ itemKey, interactionKey }）。
     - 工作台左栏物品卡展开后显示"基础信息"和"已采集交互"两段，交互条目可点击选中。
+
+    V0.5.19 白厨Mufy字段编辑器品牌化、帮助中心与可调整编辑环境
+    - 品牌统一：工具名称改为"白厨Mufy字段编辑器"。
+    - 帮助中心模态框：面板顶栏与工作台顶栏各新增 [?] 按钮，含"使用说明"和"作者的话"两个 Tab。
+    - 悬浮按钮重写：Pointer Events 拖拽（6px 阈值 + 视口边界约束 + 12px 边距），位置持久化。
+    - 浮动面板拖拽重写：Pointer Events（替代旧 mousedown 方案），位置持久化。
+    - UI 偏好持久化（localStorage whitechef-mufy-editor:ui-layout:v1）。
+    - 工作台左/右栏可调宽度：6px 拖拽手柄，左 180-440px，右 190-380px，CSS 变量驱动。
+    - 宽度 <960px 时隐藏手柄；专注模式隐藏手柄。
+    - 修复左栏/中区同步 bug：进入工作台时始终 selectWbField(0)。
+    - 字体大小设置（Aa 按钮 → 弹出层，13-22px，默认 15px），仅影响主编辑器。
+    - Markdown 安全预览：普通字段和交互编辑器各新增 [编辑]/[预览] 切换；全 DOM API，无 innerHTML。
     - 工作台中间区：选中交互时展示结构化表单（交互名称 / 提示词 / 使用后文案数组 / 使用后操作）。
     - "写入当前字段"在交互模式下禁用并显示说明；"还原"还原 draftData → syncedData。
     - "复制给 LLM"追加交互 draftData 导出块，parseMarkdownToMap 遇此块立即停止解析。
@@ -95,14 +107,14 @@
     - 恢复初始版本：draft → original（不触碰 Mufy DOM）。
     - 右侧信息区全面换成 Token 估算（本地近似：CJK≈1token，非CJK≈1/4token）。
     - 关键字段 Token 合计：角色设定、开场设计、输出设定、情节设定、样例对话、文风。
-    - 上限 20090 Token，超出变红；固定提示资料库额外占 ~5000 Token。
+    - 上限 20900 Token，超出变红；固定提示资料库额外占 ~5000 Token。
 
     V0.3.0 工作台外壳沿用，V0.2.2 写入逻辑完全未改动。
   */
 
   /* ─── Mufy 核心字段（Token 合计只统计这五项） ─── */
   var TRACKED_FIELD_LABELS = ['人设', '开场设计', '输出设定', '情节设定', '样例对话&文风'];
-  var TOKEN_LIMIT = 20090;
+  var TOKEN_LIMIT = 20900;
 
   /* ─── 全局状态 ─── */
 
@@ -126,6 +138,49 @@
   var wbCurrentInteraction = null;  // { itemKey, interactionKey } | null
   var wbFocusMode = false;
   var wbCurrentInteractionEditorTarget = null;  // { kind: 'prompt' | 'afterCopywriting', copywritingIndex: number | null }
+
+  // UI 偏好（持久化至 localStorage）
+  var UI_PREFS_KEY = 'whitechef-mufy-editor:ui-layout:v1';
+  var uiPrefs = {
+    launcherPosition: null,   // { x, y } — bottom-right origin  (null = default)
+    panelPosition: null,      // { left, top } — absolute px (null = default)
+    workbenchLeftWidth: 250,  // px
+    workbenchRightWidth: 230, // px
+    editorFontSize: 15        // px
+  };
+
+  function loadUiPrefs() {
+    try {
+      var raw = localStorage.getItem(UI_PREFS_KEY);
+      if (!raw) return;
+      var parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.launcherPosition) uiPrefs.launcherPosition = parsed.launcherPosition;
+        if (parsed.panelPosition) uiPrefs.panelPosition = parsed.panelPosition;
+        if (typeof parsed.workbenchLeftWidth === 'number') uiPrefs.workbenchLeftWidth = parsed.workbenchLeftWidth;
+        if (typeof parsed.workbenchRightWidth === 'number') uiPrefs.workbenchRightWidth = parsed.workbenchRightWidth;
+        if (typeof parsed.editorFontSize === 'number') uiPrefs.editorFontSize = parsed.editorFontSize;
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function saveUiPrefs() {
+    try {
+      localStorage.setItem(UI_PREFS_KEY, JSON.stringify(uiPrefs));
+    } catch (e) { /* ignore */ }
+  }
+
+  function applyWbColumnWidths() {
+    if (!wbEl) return;
+    wbEl.style.setProperty('--wb-left-width', uiPrefs.workbenchLeftWidth + 'px');
+    wbEl.style.setProperty('--wb-right-width', uiPrefs.workbenchRightWidth + 'px');
+  }
+
+  function applyEditorFontSize() {
+    if (wbEl) {
+      wbEl.style.setProperty('--wb-editor-font-size', uiPrefs.editorFontSize + 'px');
+    }
+  }
 
   // 交互采集状态
   var interactionSnapshotsByItemKey = {};      // { itemKey: { interactionKey: snapshot } }
@@ -1295,14 +1350,23 @@
       '  <button id="mufy-wb-restore" class="secondary" title="放弃当前字段或交互草稿的编辑，恢复到最近一次同步版本。">还原当前字段草稿</button>',
       '  <button id="mufy-wb-focus" class="secondary" title="隐藏左右栏，专注编辑当前内容。">⛶ 专注编辑</button>',
       '  <span id="mufy-wb-title" class="wb-title">工作台</span>',
+      '  <button id="mufy-wb-aa" class="secondary wb-icon-btn" title="显示设置：字体大小与布局">Aa</button>',
+      '  <button id="mufy-wb-help" class="secondary wb-icon-btn" title="帮助">?</button>',
+      '  <div id="mufy-wb-aa-popover" class="wb-aa-popover" style="display:none"></div>',
       '</div>',
       '<div id="mufy-wb-body">',
       '  <div id="mufy-wb-left">',
       '    <div id="mufy-wb-field-list"></div>',
       '  </div>',
+      '  <div id="mufy-wb-left-handle" class="wb-col-handle" title="拖拽调整左栏宽度"></div>',
       '  <div id="mufy-wb-center">',
       '    <div id="mufy-item-context"></div>',
+      '    <div id="mufy-wb-editor-bar" class="wb-editor-mode-bar">',
+      '      <button id="mufy-wb-mode-edit" class="wb-mode-btn active">编辑</button>',
+      '      <button id="mufy-wb-mode-preview" class="wb-mode-btn">预览</button>',
+      '    </div>',
       '    <textarea id="mufy-wb-editor" placeholder="从左侧选择一个字段…"></textarea>',
+      '    <div id="mufy-wb-preview" class="wb-preview-pane" style="display:none"></div>',
       '    <div id="mufy-wb-action-bar">',
       '      <button id="mufy-wb-write-btn">写入当前字段到 Mufy</button>',
       '      <button id="mufy-wb-undo-write-btn" class="secondary" style="display:none">撤回编辑页写入</button>',
@@ -1316,7 +1380,12 @@
       '        <button type="button" id="mufy-ixn-copy-name" class="mufy-ixn-copy-btn">复制名称</button>',
       '      </div>',
       '      <div id="mufy-ixn-tab-bar"></div>',
+      '      <div id="mufy-ixn-editor-bar" class="wb-editor-mode-bar">',
+      '        <button id="mufy-ixn-mode-edit" class="wb-mode-btn active">编辑</button>',
+      '        <button id="mufy-ixn-mode-preview" class="wb-mode-btn">预览</button>',
+      '      </div>',
       '      <textarea id="mufy-ixn-main-editor" class="mufy-ixn-main-textarea" placeholder="选择上方 tab 开始编辑…"></textarea>',
+      '      <div id="mufy-ixn-preview" class="wb-preview-pane" style="display:none"></div>',
       '      <div class="mufy-ixn-field-group mufy-ixn-action-row">',
       '        <label class="mufy-ixn-label">使用后操作</label>',
       '        <label class="mufy-ixn-checkbox-label">',
@@ -1336,6 +1405,7 @@
       '      </div>',
       '    </div>',
       '  </div>',
+      '  <div id="mufy-wb-right-handle" class="wb-col-handle" title="拖拽调整右栏宽度"></div>',
       '  <div id="mufy-wb-right">',
       '    <div id="mufy-wb-right-normal">',
       '      <div class="wb-section-title">当前字段</div>',
@@ -1566,9 +1636,94 @@
       this.textContent = wbFocusMode ? '↙ 退出专注编辑' : '⛶ 专注编辑';
     });
 
-    /* Esc：只退出专注模式，不关工作台 */
+    /* 帮助按钮 */
+    wbEl.querySelector('#mufy-wb-help').addEventListener('click', function () {
+      openGuideModal();
+    });
+
+    /* Aa 字体大小设置 */
+    wbEl.querySelector('#mufy-wb-aa').addEventListener('click', function (e) {
+      e.stopPropagation();
+      toggleAaPopover();
+    });
+
+    /* 普通字段编辑/预览切换 */
+    wbEl.querySelector('#mufy-wb-mode-edit').addEventListener('click', function () {
+      setNormalEditorMode('edit');
+    });
+    wbEl.querySelector('#mufy-wb-mode-preview').addEventListener('click', function () {
+      setNormalEditorMode('preview');
+    });
+
+    /* 交互编辑/预览切换 */
+    wbEl.querySelector('#mufy-ixn-mode-edit').addEventListener('click', function () {
+      setIxnEditorMode('edit');
+    });
+    wbEl.querySelector('#mufy-ixn-mode-preview').addEventListener('click', function () {
+      setIxnEditorMode('preview');
+    });
+
+    /* 左栏拖拽手柄 */
+    (function () {
+      var handle = wbEl.querySelector('#mufy-wb-left-handle');
+      var startX = 0;
+      var startW = 0;
+      handle.addEventListener('pointerdown', function (e) {
+        if (window.innerWidth < 960) return;
+        e.preventDefault();
+        handle.setPointerCapture(e.pointerId);
+        startX = e.clientX;
+        startW = uiPrefs.workbenchLeftWidth;
+      });
+      handle.addEventListener('pointermove', function (e) {
+        if (!handle.hasPointerCapture(e.pointerId)) return;
+        var delta = e.clientX - startX;
+        var newW = Math.min(440, Math.max(180, startW + delta));
+        uiPrefs.workbenchLeftWidth = newW;
+        applyWbColumnWidths();
+      });
+      handle.addEventListener('pointerup', function (e) {
+        if (!handle.hasPointerCapture(e.pointerId)) return;
+        handle.releasePointerCapture(e.pointerId);
+        saveUiPrefs();
+      });
+    })();
+
+    /* 右栏拖拽手柄 */
+    (function () {
+      var handle = wbEl.querySelector('#mufy-wb-right-handle');
+      var startX = 0;
+      var startW = 0;
+      handle.addEventListener('pointerdown', function (e) {
+        if (window.innerWidth < 960) return;
+        e.preventDefault();
+        handle.setPointerCapture(e.pointerId);
+        startX = e.clientX;
+        startW = uiPrefs.workbenchRightWidth;
+      });
+      handle.addEventListener('pointermove', function (e) {
+        if (!handle.hasPointerCapture(e.pointerId)) return;
+        var delta = startX - e.clientX;
+        var newW = Math.min(380, Math.max(190, startW + delta));
+        uiPrefs.workbenchRightWidth = newW;
+        applyWbColumnWidths();
+      });
+      handle.addEventListener('pointerup', function (e) {
+        if (!handle.hasPointerCapture(e.pointerId)) return;
+        handle.releasePointerCapture(e.pointerId);
+        saveUiPrefs();
+      });
+    })();
+
+    /* Esc：优先关闭帮助弹窗，其次退出专注模式，不关工作台 */
     wbEl.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape' && wbFocusMode) {
+      if (event.key !== 'Escape') return;
+      if (document.getElementById('mufy-guide-modal')) {
+        event.stopPropagation();
+        closeGuideModal();
+        return;
+      }
+      if (wbFocusMode) {
         event.stopPropagation();
         wbFocusMode = false;
         wbEl.classList.remove('mufy-wb-focus');
@@ -1588,6 +1743,8 @@
         var focusBtn = wbEl.querySelector('#mufy-wb-focus');
         if (focusBtn) focusBtn.textContent = wbFocusMode ? '↙ 退出专注编辑' : '⛶ 专注编辑';
         renderWbFieldList();
+        applyWbColumnWidths();
+        applyEditorFontSize();
         if (wbCurrentInteraction) {
           showInteractionEditor();
           updateWbWriteControls();
@@ -1633,6 +1790,8 @@
     wbWritePending = false;
     renderWbFieldList();
     wbEl.classList.add('open');
+    applyWbColumnWidths();
+    applyEditorFontSize();
     selectWbField(0);
   }
 
@@ -1861,9 +2020,415 @@
     wbEl.classList.remove('open');
   }
 
+  /* ─── 安全 Markdown 渲染（纯 DOM，无 innerHTML，无外部资源） ─── */
+
+  function renderSafeMarkdown(text, container) {
+    container.textContent = '';
+    var lines = asText(text).replace(/\r/g, '').split('\n');
+    var i = 0;
+
+    function appendEl(tag, text, parent) {
+      var el = document.createElement(tag);
+      if (text !== undefined) el.textContent = text;
+      (parent || container).appendChild(el);
+      return el;
+    }
+
+    function parseInline(raw, parent) {
+      // bold, italic, strikethrough, inline code — use regex splits
+      var re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|~~[^~]+~~)/g;
+      var last = 0;
+      var m;
+      while ((m = re.exec(raw)) !== null) {
+        if (m.index > last) {
+          parent.appendChild(document.createTextNode(raw.slice(last, m.index)));
+        }
+        var tok = m[0];
+        if (tok.startsWith('`') && tok.endsWith('`')) {
+          var code = document.createElement('code');
+          code.textContent = tok.slice(1, -1);
+          parent.appendChild(code);
+        } else if (tok.startsWith('**')) {
+          var b = document.createElement('strong');
+          b.textContent = tok.slice(2, -2);
+          parent.appendChild(b);
+        } else if (tok.startsWith('*')) {
+          var em = document.createElement('em');
+          em.textContent = tok.slice(1, -1);
+          parent.appendChild(em);
+        } else if (tok.startsWith('~~')) {
+          var s = document.createElement('s');
+          s.textContent = tok.slice(2, -2);
+          parent.appendChild(s);
+        }
+        last = m.index + tok.length;
+      }
+      if (last < raw.length) parent.appendChild(document.createTextNode(raw.slice(last)));
+    }
+
+    while (i < lines.length) {
+      var line = lines[i];
+
+      // Fenced code block
+      if (line.startsWith('```')) {
+        var pre = document.createElement('pre');
+        var codeEl = document.createElement('code');
+        pre.appendChild(codeEl);
+        container.appendChild(pre);
+        i += 1;
+        var codeLines = [];
+        while (i < lines.length && !lines[i].startsWith('```')) {
+          codeLines.push(lines[i]);
+          i += 1;
+        }
+        codeEl.textContent = codeLines.join('\n');
+        i += 1;
+        continue;
+      }
+
+      // Heading
+      var hMatch = line.match(/^(#{1,6})\s+(.*)/);
+      if (hMatch) {
+        var level = Math.min(hMatch[1].length, 6);
+        var hEl = appendEl('h' + level);
+        parseInline(hMatch[2], hEl);
+        i += 1;
+        continue;
+      }
+
+      // HR
+      if (/^[-*_]{3,}\s*$/.test(line)) {
+        appendEl('hr');
+        i += 1;
+        continue;
+      }
+
+      // Blockquote
+      if (line.startsWith('> ') || line === '>') {
+        var bq = document.createElement('blockquote');
+        container.appendChild(bq);
+        while (i < lines.length && (lines[i].startsWith('> ') || lines[i] === '>')) {
+          var bqP = document.createElement('p');
+          parseInline(lines[i].replace(/^>\s?/, ''), bqP);
+          bq.appendChild(bqP);
+          i += 1;
+        }
+        continue;
+      }
+
+      // Unordered list
+      if (/^[-*+]\s/.test(line)) {
+        var ul = document.createElement('ul');
+        container.appendChild(ul);
+        while (i < lines.length && /^[-*+]\s/.test(lines[i])) {
+          var li = document.createElement('li');
+          parseInline(lines[i].replace(/^[-*+]\s/, ''), li);
+          ul.appendChild(li);
+          i += 1;
+        }
+        continue;
+      }
+
+      // Ordered list
+      if (/^\d+\.\s/.test(line)) {
+        var ol = document.createElement('ol');
+        container.appendChild(ol);
+        while (i < lines.length && /^\d+\.\s/.test(lines[i])) {
+          var oli = document.createElement('li');
+          parseInline(lines[i].replace(/^\d+\.\s/, ''), oli);
+          ol.appendChild(oli);
+          i += 1;
+        }
+        continue;
+      }
+
+      // Empty line — paragraph break (skip)
+      if (line.trim() === '') {
+        i += 1;
+        continue;
+      }
+
+      // Paragraph
+      var p = document.createElement('p');
+      parseInline(line, p);
+      container.appendChild(p);
+      i += 1;
+    }
+  }
+
+  /* ─── 普通字段 编辑/预览 切换 ─── */
+
+  function setNormalEditorMode(mode) {
+    if (!wbEl) return;
+    var editorEl = wbEl.querySelector('#mufy-wb-editor');
+    var previewEl = wbEl.querySelector('#mufy-wb-preview');
+    var editBtn = wbEl.querySelector('#mufy-wb-mode-edit');
+    var prevBtn = wbEl.querySelector('#mufy-wb-mode-preview');
+    if (!editorEl || !previewEl) return;
+    if (mode === 'preview') {
+      var snap = (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) ? wbSnapshot[wbCurrentIndex] : null;
+      renderSafeMarkdown(snap ? snap.draftContent : editorEl.value, previewEl);
+      editorEl.style.display = 'none';
+      previewEl.style.display = '';
+      if (editBtn) editBtn.classList.remove('active');
+      if (prevBtn) prevBtn.classList.add('active');
+    } else {
+      editorEl.style.display = '';
+      previewEl.style.display = 'none';
+      if (editBtn) editBtn.classList.add('active');
+      if (prevBtn) prevBtn.classList.remove('active');
+    }
+  }
+
+  /* ─── 交互编辑器 编辑/预览 切换 ─── */
+
+  function setIxnEditorMode(mode) {
+    if (!wbEl) return;
+    var editorEl = wbEl.querySelector('#mufy-ixn-main-editor');
+    var previewEl = wbEl.querySelector('#mufy-ixn-preview');
+    var editBtn = wbEl.querySelector('#mufy-ixn-mode-edit');
+    var prevBtn = wbEl.querySelector('#mufy-ixn-mode-preview');
+    if (!editorEl || !previewEl) return;
+    if (mode === 'preview') {
+      renderSafeMarkdown(editorEl.value, previewEl);
+      editorEl.style.display = 'none';
+      previewEl.style.display = '';
+      if (editBtn) editBtn.classList.remove('active');
+      if (prevBtn) prevBtn.classList.add('active');
+    } else {
+      editorEl.style.display = '';
+      previewEl.style.display = 'none';
+      if (editBtn) editBtn.classList.add('active');
+      if (prevBtn) prevBtn.classList.remove('active');
+    }
+  }
+
+  /* ─── Aa 显示设置弹出层 ─── */
+
+  function toggleAaPopover() {
+    var pop = wbEl && wbEl.querySelector('#mufy-wb-aa-popover');
+    if (!pop) return;
+    if (pop.style.display !== 'none') {
+      pop.style.display = 'none';
+      return;
+    }
+    buildAaPopover(pop);
+    pop.style.display = 'block';
+
+    function outsideClick(e) {
+      if (!pop.contains(e.target) && e.target.id !== 'mufy-wb-aa') {
+        pop.style.display = 'none';
+        document.removeEventListener('pointerdown', outsideClick, true);
+      }
+    }
+    document.addEventListener('pointerdown', outsideClick, true);
+  }
+
+  function buildAaPopover(pop) {
+    pop.textContent = '';
+
+    var title = document.createElement('div');
+    title.className = 'wb-aa-title';
+    title.textContent = '显示设置';
+    pop.appendChild(title);
+
+    // Font size control
+    var row = document.createElement('div');
+    row.className = 'wb-aa-row';
+
+    var label = document.createElement('span');
+    label.className = 'wb-aa-label';
+    label.textContent = '字体大小';
+    row.appendChild(label);
+
+    var dec = document.createElement('button');
+    dec.className = 'wb-aa-btn';
+    dec.textContent = '−';
+    row.appendChild(dec);
+
+    var sizeDisplay = document.createElement('span');
+    sizeDisplay.className = 'wb-aa-size';
+    sizeDisplay.textContent = uiPrefs.editorFontSize + 'px';
+    row.appendChild(sizeDisplay);
+
+    var inc = document.createElement('button');
+    inc.className = 'wb-aa-btn';
+    inc.textContent = '+';
+    row.appendChild(inc);
+
+    pop.appendChild(row);
+
+    dec.addEventListener('click', function () {
+      if (uiPrefs.editorFontSize <= 13) return;
+      uiPrefs.editorFontSize -= 1;
+      sizeDisplay.textContent = uiPrefs.editorFontSize + 'px';
+      applyEditorFontSize();
+      saveUiPrefs();
+    });
+    inc.addEventListener('click', function () {
+      if (uiPrefs.editorFontSize >= 22) return;
+      uiPrefs.editorFontSize += 1;
+      sizeDisplay.textContent = uiPrefs.editorFontSize + 'px';
+      applyEditorFontSize();
+      saveUiPrefs();
+    });
+
+    var divider = document.createElement('div');
+    divider.className = 'wb-aa-divider';
+    pop.appendChild(divider);
+
+    var resetLayout = document.createElement('button');
+    resetLayout.className = 'wb-aa-reset';
+    resetLayout.textContent = '重置栏宽';
+    resetLayout.addEventListener('click', function () {
+      uiPrefs.workbenchLeftWidth = 250;
+      uiPrefs.workbenchRightWidth = 230;
+      applyWbColumnWidths();
+      saveUiPrefs();
+      toast('栏宽已重置');
+    });
+    pop.appendChild(resetLayout);
+
+    var resetPos = document.createElement('button');
+    resetPos.className = 'wb-aa-reset';
+    resetPos.textContent = '重置位置';
+    resetPos.addEventListener('click', function () {
+      uiPrefs.launcherPosition = null;
+      uiPrefs.panelPosition = null;
+      var toggle = document.getElementById('mufy-helper-toggle');
+      if (toggle) { toggle.style.bottom = '24px'; toggle.style.right = '24px'; toggle.style.top = ''; toggle.style.left = ''; }
+      if (panelEl) { panelEl.style.top = '80px'; panelEl.style.right = '24px'; panelEl.style.left = ''; }
+      saveUiPrefs();
+      toast('按钮和面板位置已重置');
+    });
+    pop.appendChild(resetPos);
+  }
+
+  /* ─── 帮助中心弹窗 ─── */
+
+  function openGuideModal() {
+    if (document.getElementById('mufy-guide-modal')) return;
+    var overlay = document.createElement('div');
+    overlay.id = 'mufy-guide-modal';
+    overlay.className = 'mufy-guide-overlay';
+
+    var box = document.createElement('div');
+    box.className = 'mufy-guide-box';
+
+    var header = document.createElement('div');
+    header.className = 'mufy-guide-header';
+    var titleEl = document.createElement('span');
+    titleEl.className = 'mufy-guide-title';
+    titleEl.textContent = '白厨Mufy字段编辑器 — 帮助中心';
+    var closeBtn = document.createElement('button');
+    closeBtn.className = 'mufy-guide-close';
+    closeBtn.textContent = '✕';
+    closeBtn.addEventListener('click', closeGuideModal);
+    header.appendChild(titleEl);
+    header.appendChild(closeBtn);
+    box.appendChild(header);
+
+    var tabBar = document.createElement('div');
+    tabBar.className = 'mufy-guide-tab-bar';
+    var tabs = [
+      { id: 'usage', label: '使用说明' },
+      { id: 'author', label: '作者的话' }
+    ];
+    var tabBtns = {};
+    tabs.forEach(function (tab) {
+      var btn = document.createElement('button');
+      btn.className = 'mufy-guide-tab';
+      btn.textContent = tab.label;
+      btn.addEventListener('click', function () { showGuideTab(tab.id); });
+      tabBtns[tab.id] = btn;
+      tabBar.appendChild(btn);
+    });
+    box.appendChild(tabBar);
+
+    var content = document.createElement('div');
+    content.className = 'mufy-guide-content';
+    box.appendChild(content);
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    overlay.addEventListener('pointerdown', function (e) {
+      if (e.target === overlay) closeGuideModal();
+    });
+    document.addEventListener('keydown', function escGuide(e) {
+      if (e.key === 'Escape') { closeGuideModal(); document.removeEventListener('keydown', escGuide, true); }
+    }, true);
+
+    function showGuideTab(id) {
+      Object.keys(tabBtns).forEach(function (k) {
+        tabBtns[k].classList.toggle('active', k === id);
+      });
+      content.textContent = '';
+      if (id === 'usage') {
+        renderSafeMarkdown([
+          '## 快速开始',
+          '',
+          '1. 点击右下角悬浮按钮打开面板',
+          '2. 点击**扫描字段**读取当前 Mufy 编辑页的所有字段，检索完毕后会自动录入工作区方便编辑。',
+          '3. 在工作台中编辑草稿，点击**写入当前字段到 Mufy** 注入',
+          '',
+          '## 工作台功能',
+          '',
+          '- **左栏**：字段列表，点击切换，拖拽分隔线调整宽度',
+          '- **中区**：主编辑器，支持 [编辑] / [预览] 切换（安全 Markdown 预览）',
+          '- **右栏**：Token 统计与草稿状态信息',
+          '- **Aa**：调整字体大小（13–22px），重置栏宽与位置',
+          '- **⛶ 专注编辑**：隐藏左右栏，聚焦中区',
+          '- **Esc**：依次关闭：帮助弹窗 → 退出专注模式',
+          '',
+          '## 物品与交互',
+          '',
+          '由于猫的代码设计，无法一键读取物品栏交互按钮提示词。物品栏的窗口和交互需要你手动用悬浮面板绑定。',
+          '- 在mufy界面点开物品栏交互后，在悬浮窗对应物品名称下点集采集交互，即可自动录入数据进工作区进行编辑。',
+          '- 交互草稿仅存储于本地工作台，需手动打开 Mufy 原生交互弹窗粘贴保存',
+          '',
+          '## 安全说明',
+          '',
+          '- 工具**不会**自动写回 Mufy 云端或触发"更新角色"',
+          '- Markdown 预览不执行任何脚本，不加载外部资源',
+          '- 草稿不跨页面刷新持久化'
+        ].join('\n'), content);
+      } else {
+        renderSafeMarkdown([
+          '## 作者的话',
+          '',
+          '本油猴插件为方便白u写卡而制作',
+          '严禁二传二改，尊重个人劳动。',
+          '',
+          '希望大家都来爱白~',
+          '',
+          '— 一个不知名的白厨'
+        ].join('\n'), content);
+      }
+    }
+
+    showGuideTab('usage');
+  }
+
+  function closeGuideModal() {
+    var modal = document.getElementById('mufy-guide-modal');
+    if (modal) modal.remove();
+  }
+
   function showNormalEditor() {
     if (!wbEl) return;
-    wbEl.querySelector('#mufy-wb-editor').style.display = '';
+    // Reset to edit mode before showing
+    var editorEl = wbEl.querySelector('#mufy-wb-editor');
+    var previewEl = wbEl.querySelector('#mufy-wb-preview');
+    var editorBar = wbEl.querySelector('#mufy-wb-editor-bar');
+    if (editorEl) editorEl.style.display = '';
+    if (previewEl) previewEl.style.display = 'none';
+    if (editorBar) editorBar.style.display = '';
+    var editBtn = wbEl.querySelector('#mufy-wb-mode-edit');
+    var prevBtn = wbEl.querySelector('#mufy-wb-mode-preview');
+    if (editBtn) editBtn.classList.add('active');
+    if (prevBtn) prevBtn.classList.remove('active');
+
     wbEl.querySelector('#mufy-wb-action-bar').style.display = '';
     wbEl.querySelector('#mufy-wb-interaction-form').style.display = 'none';
     var rNormal = wbEl.querySelector('#mufy-wb-right-normal');
@@ -2046,10 +2611,24 @@
     if (!snap) return;
     var dd = snap.draftData;
 
-    wbEl.querySelector('#mufy-wb-editor').style.display = 'none';
+    var editorEl = wbEl.querySelector('#mufy-wb-editor');
+    var previewEl = wbEl.querySelector('#mufy-wb-preview');
+    var editorBar = wbEl.querySelector('#mufy-wb-editor-bar');
+    if (editorEl) editorEl.style.display = 'none';
+    if (previewEl) previewEl.style.display = 'none';
+    if (editorBar) editorBar.style.display = 'none';
     wbEl.querySelector('#mufy-wb-action-bar').style.display = 'none';
     var form = wbEl.querySelector('#mufy-wb-interaction-form');
     form.style.display = 'flex';
+    // Reset ixn editor mode to 'edit'
+    var ixnEditorEl = form.querySelector('#mufy-ixn-main-editor');
+    var ixnPreviewEl = form.querySelector('#mufy-ixn-preview');
+    var ixnEditBtn = form.querySelector('#mufy-ixn-mode-edit');
+    var ixnPrevBtn = form.querySelector('#mufy-ixn-mode-preview');
+    if (ixnEditorEl) ixnEditorEl.style.display = '';
+    if (ixnPreviewEl) ixnPreviewEl.style.display = 'none';
+    if (ixnEditBtn) ixnEditBtn.classList.add('active');
+    if (ixnPrevBtn) ixnPrevBtn.classList.remove('active');
 
     var rNormal = wbEl.querySelector('#mufy-wb-right-normal');
     var rIxn = wbEl.querySelector('#mufy-wb-right-ixn');
@@ -2691,7 +3270,7 @@
       '#mufy-workbench{position:fixed;inset:0;background:#13131a;z-index:2147483100;display:none;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e6e6ef;font-size:13px;pointer-events:auto}',
       '#mufy-workbench.open{display:flex}',
 
-      '#mufy-wb-topbar{height:50px;min-height:50px;background:#1a1a28;border-bottom:1px solid #2a2a3e;display:flex;align-items:center;gap:8px;padding:0 16px;flex-shrink:0}',
+      '#mufy-wb-topbar{position:relative;height:50px;min-height:50px;background:#1a1a28;border-bottom:1px solid #2a2a3e;display:flex;align-items:center;gap:8px;padding:0 16px;flex-shrink:0}',
       '#mufy-wb-topbar button{background:#8b5cf6;border:none;color:#fff;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap}',
       '#mufy-wb-topbar button.secondary{background:#2e2e44}',
       '#mufy-wb-topbar button:hover{filter:brightness(1.15)}',
@@ -2699,14 +3278,14 @@
 
       '#mufy-wb-body{flex:1;display:flex;overflow:hidden}',
 
-      '#mufy-wb-left{width:210px;min-width:210px;border-right:1px solid #222236;overflow-y:auto;background:#161622;flex-shrink:0}',
+      '#mufy-wb-left{width:var(--wb-left-width,250px);min-width:var(--wb-left-width,250px);border-right:1px solid #222236;overflow-y:auto;background:#161622;flex-shrink:0}',
       '.mufy-wb-field-item{padding:9px 12px;cursor:pointer;border-bottom:1px solid #1c1c2e;font-size:13px;color:#b0b0cc;transition:background .12s;display:flex;align-items:center;gap:8px;overflow:hidden}',
       '.mufy-wb-field-item:hover{background:#1e1e32}',
       '.mufy-wb-field-item.active{background:#28194a;color:#c4b5fd;border-left:3px solid #8b5cf6;padding-left:9px}',
       '.mufy-wb-dot{width:7px;height:7px;min-width:7px;border-radius:50%;display:inline-block}',
 
       '#mufy-wb-center{flex:1;display:flex;flex-direction:column;padding:12px 16px 12px;gap:8px;overflow:hidden}',
-      '#mufy-wb-editor{flex:1;width:100%;background:#1b1b28;color:#e6e6ef;border:1px solid #333350;border-radius:8px;padding:14px;font-size:14px;line-height:1.85;resize:none;box-sizing:border-box;font-family:inherit;outline:none}',
+      '#mufy-wb-editor{flex:1;width:100%;background:#1b1b28;color:#e6e6ef;border:1px solid #333350;border-radius:8px;padding:14px;font-size:var(--wb-editor-font-size,15px);line-height:1.85;resize:none;box-sizing:border-box;font-family:inherit;outline:none}',
       '#mufy-wb-editor:focus{border-color:#8b5cf6}',
       '#mufy-wb-action-bar{display:flex;align-items:center;gap:8px;flex-shrink:0}',
       '#mufy-wb-write-btn{background:#059669;border:none;color:#fff;padding:8px 18px;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap}',
@@ -2719,7 +3298,7 @@
       '#mufy-wb-write-status.err{color:#f87171}',
       '#mufy-wb-write-status.warn{color:#fbbf24}',
 
-      '#mufy-wb-right{width:210px;min-width:210px;border-left:1px solid #222236;padding:14px 12px;overflow-y:auto;background:#161622;flex-shrink:0;display:flex;flex-direction:column;gap:8px;font-size:12px}',
+      '#mufy-wb-right{width:var(--wb-right-width,230px);min-width:var(--wb-right-width,230px);border-left:1px solid #222236;padding:14px 12px;overflow-y:auto;background:#161622;flex-shrink:0;display:flex;flex-direction:column;gap:8px;font-size:12px}',
       '#mufy-wb-right-normal,#mufy-wb-right-ixn{display:flex;flex-direction:column;gap:8px}',
       '.wb-ixn-val-wrap{max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
       '.wb-ixn-guide{font-size:11px;color:#7b769a;line-height:1.8}',
@@ -2799,7 +3378,7 @@
       '.mufy-ixn-tab-add{background:#1e1c2e;border:1px dashed #3d3a58;color:#7b769a;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;white-space:nowrap}',
       '.mufy-ixn-tab-add:hover{border-color:#8b5cf6;color:#c4b5fd}',
       /* 大主编辑器 */
-      '#mufy-ixn-main-editor{flex:1;min-height:0;width:100%;box-sizing:border-box;background:#1b1b28;color:#e6e6ef;border:1px solid #333350;border-radius:6px;padding:10px 12px;font-size:13px;line-height:1.75;resize:none;font-family:inherit;outline:none}',
+      '#mufy-ixn-main-editor{flex:1;min-height:0;width:100%;box-sizing:border-box;background:#1b1b28;color:#e6e6ef;border:1px solid #333350;border-radius:6px;padding:10px 12px;font-size:var(--wb-editor-font-size,15px);line-height:1.75;resize:none;font-family:inherit;outline:none}',
       '#mufy-ixn-main-editor:focus{border-color:#8b5cf6}',
       '.mufy-ixn-action-row{flex-direction:row;align-items:center;gap:12px;flex-shrink:0}',
       '.mufy-ixn-checkbox-label{display:flex;align-items:center;gap:6px;cursor:pointer;color:#cbc6e7;font-size:13px}',
@@ -2820,7 +3399,72 @@
 
       /* ── 交互表单页脚 ── */
       '.mufy-ixn-footer{display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap}',
-      '.mufy-ixn-footer button{flex:1;min-width:120px}'
+      '.mufy-ixn-footer button{flex:1;min-width:120px}',
+
+      /* ── 面板标题与帮助按钮 ── */
+      '.mufy-panel-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.mufy-panel-help-btn{background:transparent;border:1px solid #4a4a62;color:#9a9aae;border-radius:50%;width:20px;height:20px;font-size:12px;line-height:1;cursor:pointer;padding:0;display:flex;align-items:center;justify-content:center;flex-shrink:0}',
+      '.mufy-panel-help-btn:hover{border-color:#8b5cf6;color:#c4b5fd}',
+
+      /* ── 工作台顶栏图标按钮 ── */
+      '.wb-icon-btn{padding:4px 10px!important;font-size:12px!important;font-weight:600}',
+
+      /* ── 列调宽手柄 ── */
+      '.wb-col-handle{width:6px;min-width:6px;cursor:col-resize;background:transparent;flex-shrink:0;transition:background .15s;z-index:1}',
+      '.wb-col-handle:hover{background:#333350}',
+      '#mufy-workbench.mufy-wb-focus .wb-col-handle{display:none!important}',
+      '@media (max-width:959px){.wb-col-handle{display:none!important}}',
+
+      /* ── 编辑/预览切换条 ── */
+      '.wb-editor-mode-bar{display:flex;gap:4px;flex-shrink:0}',
+      '.wb-mode-btn{background:#272540;border:none;color:#9e96d5;border-radius:5px;padding:4px 12px;font-size:12px;cursor:pointer}',
+      '.wb-mode-btn.active{background:#5a35ab;color:#fff}',
+      '.wb-mode-btn:hover:not(.active){background:#333254;color:#d9d3ff}',
+
+      /* ── Markdown 预览面板 ── */
+      '.wb-preview-pane{flex:1;min-height:0;overflow-y:auto;padding:14px;background:#1b1b28;border:1px solid #333350;border-radius:8px;box-sizing:border-box;color:#e6e6ef;font-size:var(--wb-editor-font-size,15px);line-height:1.85}',
+      '.wb-preview-pane p{margin:0 0 8px}',
+      '.wb-preview-pane h1,.wb-preview-pane h2,.wb-preview-pane h3,.wb-preview-pane h4{margin:10px 0 4px;color:#c4b5fd}',
+      '.wb-preview-pane code{background:#252240;padding:1px 5px;border-radius:3px;font-size:.9em;color:#e9d5ff}',
+      '.wb-preview-pane pre{background:#1a1a30;border-radius:6px;padding:10px 12px;overflow-x:auto;margin:6px 0}',
+      '.wb-preview-pane pre code{background:none;padding:0}',
+      '.wb-preview-pane blockquote{border-left:3px solid #5a35ab;margin:6px 0;padding:4px 12px;color:#9e96d5}',
+      '.wb-preview-pane ul,.wb-preview-pane ol{margin:4px 0 8px 18px;padding:0}',
+      '.wb-preview-pane hr{border:none;border-top:1px solid #333350;margin:10px 0}',
+      '.wb-preview-pane s{color:#6b6b8a}',
+      '.wb-preview-pane strong{color:#e0d7ff}',
+
+      /* ── Aa 弹出层 ── */
+      '.wb-aa-popover{position:absolute;top:calc(100% + 6px);right:0;background:#1e1c2e;border:1px solid #3a3a58;border-radius:8px;padding:10px 12px;min-width:200px;box-shadow:0 4px 16px rgba(0,0,0,.6);z-index:2147483200}',
+      '.wb-aa-title{font-size:11px;color:#7b769a;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}',
+      '.wb-aa-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}',
+      '.wb-aa-label{flex:1;font-size:12px;color:#cbc6e7}',
+      '.wb-aa-btn{background:#34344a;border:none;color:#e6e6ef;border-radius:4px;width:24px;height:24px;cursor:pointer;font-size:15px;display:flex;align-items:center;justify-content:center}',
+      '.wb-aa-btn:hover{background:#4a4a6a}',
+      '.wb-aa-size{font-size:13px;color:#c4b5fd;min-width:38px;text-align:center}',
+      '.wb-aa-divider{height:1px;background:#2e2c40;margin:8px 0}',
+      '.wb-aa-reset{width:100%;background:#29263e;border:none;color:#9b96c8;border-radius:5px;padding:6px 0;font-size:12px;cursor:pointer;margin-bottom:4px;text-align:center}',
+      '.wb-aa-reset:hover{background:#353254;color:#d9d3ff}',
+
+      /* ── 帮助中心弹窗 ── */
+      '.mufy-guide-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:2147483500;display:flex;align-items:center;justify-content:center;pointer-events:auto}',
+      '.mufy-guide-box{background:#1b1b28;border:1px solid #3a3a58;border-radius:12px;width:640px;max-width:90vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.7)}',
+      '.mufy-guide-header{display:flex;align-items:center;gap:10px;padding:12px 16px;background:#26263a;border-bottom:1px solid #333350;flex-shrink:0}',
+      '.mufy-guide-title{flex:1;font-weight:600;font-size:14px;color:#e6e6ef;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.mufy-guide-close{background:transparent;border:none;color:#9a9aae;font-size:16px;cursor:pointer;padding:2px 6px;border-radius:4px}',
+      '.mufy-guide-close:hover{color:#e6e6ef;background:#333350}',
+      '.mufy-guide-tab-bar{display:flex;gap:4px;padding:8px 12px;border-bottom:1px solid #222236;flex-shrink:0}',
+      '.mufy-guide-tab{background:#272540;border:none;color:#9e96d5;border-radius:6px;padding:5px 14px;font-size:13px;cursor:pointer}',
+      '.mufy-guide-tab.active{background:#5a35ab;color:#fff}',
+      '.mufy-guide-tab:hover:not(.active){background:#333254;color:#d9d3ff}',
+      '.mufy-guide-content{flex:1;overflow-y:auto;padding:16px 20px;font-size:13px;line-height:1.9;color:#cbc6e7}',
+      '.mufy-guide-content p{margin:0 0 8px}',
+      '.mufy-guide-content h2{font-size:14px;color:#c4b5fd;margin:12px 0 6px}',
+      '.mufy-guide-content h3{font-size:13px;color:#c4b5fd;margin:10px 0 4px}',
+      '.mufy-guide-content strong{color:#e0d7ff}',
+      '.mufy-guide-content code{background:#252240;padding:1px 5px;border-radius:3px;font-size:.9em;color:#e9d5ff}',
+      '.mufy-guide-content ul,.mufy-guide-content ol{margin:4px 0 8px 18px}',
+      '.mufy-guide-content hr{border:none;border-top:1px solid #333350;margin:10px 0}'
     ].join('');
     document.head.appendChild(style);
   }
@@ -3103,7 +3747,7 @@
     if (!listEl) return;
 
     var title = panelEl ? panelEl.querySelector('#mufy-helper-header span') : null;
-    if (title) title.textContent = '🧩 Mufy 字段助手 V0.5.18';
+    if (title) title.textContent = '🧩 白厨Mufy字段编辑器 V0.5.19';
 
     listEl.innerHTML = '';
 
@@ -3158,7 +3802,8 @@
     panelEl.id = 'mufy-helper-panel';
     panelEl.innerHTML = [
       '<div id="mufy-helper-header">',
-      '<span>🧩 Mufy 字段助手 V0.5.18</span>',
+      '<span class="mufy-panel-title">白厨Mufy字段编辑器 V0.5.19</span>',
+      '<button class="mufy-panel-help-btn" id="mufy-panel-help" title="帮助">?</button>',
       '<span class="close">✕</span>',
       '</div>',
       '<div id="mufy-helper-toolbar">',
@@ -3186,6 +3831,11 @@
 
     panelEl.querySelector('.close').addEventListener('click', function () {
       panelEl.classList.remove('open');
+    });
+
+    panelEl.querySelector('#mufy-panel-help').addEventListener('click', function (e) {
+      e.stopPropagation();
+      openGuideModal();
     });
 
     panelEl.querySelector('[data-act="scan"]').addEventListener('click', function () {
@@ -3313,42 +3963,132 @@
     enableDrag(panelEl, panelEl.querySelector('#mufy-helper-header'));
   }
 
-  /* ─── 拖拽 ─── */
+  /* ─── 拖拽（Pointer Events） ─── */
 
-  function enableDrag(panel, handle) {
-    var dragging = false;
-    var offsetX = 0;
-    var offsetY = 0;
-    handle.addEventListener('mousedown', function (event) {
-      if (event.target && event.target.classList.contains('close')) return;
-      dragging = true;
-      var rect = panel.getBoundingClientRect();
-      offsetX = event.clientX - rect.left;
-      offsetY = event.clientY - rect.top;
-    });
-    document.addEventListener('mousemove', function (event) {
-      if (!dragging) return;
-      panel.style.left = event.clientX - offsetX + 'px';
-      panel.style.top = event.clientY - offsetY + 'px';
-      panel.style.right = 'auto';
-    });
-    document.addEventListener('mouseup', function () { dragging = false; });
+  function clampToViewport(x, y, w, h, margin) {
+    margin = margin || 12;
+    x = Math.max(margin, Math.min(window.innerWidth - w - margin, x));
+    y = Math.max(margin, Math.min(window.innerHeight - h - margin, y));
+    return { x: x, y: y };
   }
 
-  /* ─── 悬浮按钮 ─── */
+  function enableDrag(panel, handle) {
+    var pointerId = null;
+    var startX = 0;
+    var startY = 0;
+    var startLeft = 0;
+    var startTop = 0;
+
+    handle.addEventListener('pointerdown', function (event) {
+      if (event.target && (event.target.classList.contains('close') ||
+          event.target.id === 'mufy-panel-help')) return;
+      event.preventDefault();
+      handle.setPointerCapture(event.pointerId);
+      pointerId = event.pointerId;
+      var rect = panel.getBoundingClientRect();
+      startX = event.clientX;
+      startY = event.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+    });
+
+    handle.addEventListener('pointermove', function (event) {
+      if (pointerId === null || event.pointerId !== pointerId) return;
+      var dx = event.clientX - startX;
+      var dy = event.clientY - startY;
+      var newLeft = startLeft + dx;
+      var newTop = startTop + dy;
+      var rect = panel.getBoundingClientRect();
+      var clamped = clampToViewport(newLeft, newTop, rect.width, rect.height, 12);
+      panel.style.left = clamped.x + 'px';
+      panel.style.top = clamped.y + 'px';
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+    });
+
+    handle.addEventListener('pointerup', function (event) {
+      if (pointerId === null || event.pointerId !== pointerId) return;
+      handle.releasePointerCapture(pointerId);
+      pointerId = null;
+      uiPrefs.panelPosition = { left: parseInt(panel.style.left, 10), top: parseInt(panel.style.top, 10) };
+      saveUiPrefs();
+    });
+  }
+
+  /* ─── 悬浮按钮（Pointer Events + 拖拽阈值 + 视口约束） ─── */
 
   function buildToggleButton() {
     var button = document.createElement('div');
     button.id = 'mufy-helper-toggle';
     button.textContent = '🧩';
-    button.title = 'Mufy 字段助手';
-    button.addEventListener('click', function () {
+    button.title = '白厨Mufy字段编辑器';
+
+    // Apply saved position
+    if (uiPrefs.launcherPosition) {
+      button.style.bottom = 'auto';
+      button.style.right = 'auto';
+      button.style.left = uiPrefs.launcherPosition.x + 'px';
+      button.style.top = uiPrefs.launcherPosition.y + 'px';
+    }
+
+    var pointerId = null;
+    var startX = 0;
+    var startY = 0;
+    var startLeft = 0;
+    var startTop = 0;
+    var dragged = false;
+    var DRAG_THRESHOLD = 6;
+
+    button.addEventListener('pointerdown', function (event) {
+      event.preventDefault();
+      button.setPointerCapture(event.pointerId);
+      pointerId = event.pointerId;
+      dragged = false;
+      startX = event.clientX;
+      startY = event.clientY;
+      var rect = button.getBoundingClientRect();
+      startLeft = rect.left;
+      startTop = rect.top;
+    });
+
+    button.addEventListener('pointermove', function (event) {
+      if (pointerId === null || event.pointerId !== pointerId) return;
+      var dx = event.clientX - startX;
+      var dy = event.clientY - startY;
+      if (!dragged && Math.sqrt(dx * dx + dy * dy) < DRAG_THRESHOLD) return;
+      dragged = true;
+      var newLeft = startLeft + dx;
+      var newTop = startTop + dy;
+      var size = button.offsetWidth || 48;
+      var clamped = clampToViewport(newLeft, newTop, size, size, 12);
+      button.style.left = clamped.x + 'px';
+      button.style.top = clamped.y + 'px';
+      button.style.right = 'auto';
+      button.style.bottom = 'auto';
+    });
+
+    button.addEventListener('pointerup', function (event) {
+      if (pointerId === null || event.pointerId !== pointerId) return;
+      button.releasePointerCapture(pointerId);
+      pointerId = null;
+      if (dragged) {
+        uiPrefs.launcherPosition = { x: parseInt(button.style.left, 10), y: parseInt(button.style.top, 10) };
+        saveUiPrefs();
+        return;
+      }
+      // Click (no drag)
       panelEl.classList.toggle('open');
-      if (panelEl.classList.contains('open') && !fields.length) {
-        scanFields();
-        renderList();
+      if (panelEl.classList.contains('open')) {
+        if (!fields.length) { scanFields(); renderList(); }
+        // Apply saved panel position
+        if (uiPrefs.panelPosition) {
+          panelEl.style.left = uiPrefs.panelPosition.left + 'px';
+          panelEl.style.top = uiPrefs.panelPosition.top + 'px';
+          panelEl.style.right = 'auto';
+        }
       }
     });
+
     document.body.appendChild(button);
   }
 
@@ -3379,6 +4119,7 @@
   /* ─── 初始化 ─── */
 
   function init() {
+    loadUiPrefs();
     injectStyleOnce();
     ensureUI();
 
