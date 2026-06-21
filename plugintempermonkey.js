@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.5.9
+// @version      0.5.10
 // @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含物品聚合工作台、三态草稿层与安全单字段注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
@@ -11,6 +11,21 @@
   'use strict';
 
   /*
+    V0.5.10 工作台暂存返回
+    - "退出工作台"改为"← 返回 Mufy 页面"，关闭时只隐藏工作台，不清空任何草稿。
+    - openWorkbench() 检测同角色 wbSessionRoleId：相同则直接恢复会话（不重新扫描、不覆盖 draftContent）。
+    - 跨 roleId 切换时若有未写入草稿，弹确认对话框，取消则放弃进入新工作台。
+    - clearWorkbenchSession() 只在跨角色确认放弃或页面刷新后调用，不再于收起时调用。
+    - 恢复后显示 toast "已恢复本次工作台草稿"；wbLastWriteUndo / wbItemExpanded 全部保留。
+
+    V0.5.9 物品聚合工作台
+    - 左侧字段列表识别并聚合"物品｜名称 / 描述"字段，显示为可折叠物品卡片。
+    - 工作台右侧新增 item-context-tabs，同一物品的字段可快速切换。
+    - buildItemEntities / buildWorkbenchItemEntities / buildScannedItemEntities 统一聚合逻辑。
+    - isItemField / itemNameFromGroup / assignUniqueItemGroups 处理物品组名与唯一性。
+    - 三态草稿层（entryContent / syncedContent / draftContent）完整集成写入与撤回流程。
+    - wbSessionRoleId 记录工作台会话归属 roleId，为 V0.5.10 恢复机制做铺垫。
+
     V0.5.0 新增：单字段手动注入 Mufy（步骤 3）
     - 编辑器下方新增"写入当前字段到 Mufy"按钮。
     - 写入前检查 el.isConnected，失败给明确提示（已卸载 / 写入失败 / 校验不一致）。
@@ -22,7 +37,7 @@
     V0.4.1 修复：草稿导出、退出保护与 Token 统计性能
     - “人设”纳入关键字段 Token 合计。
     - 复制给 LLM 改为导出当前草稿，不再回退到进入工作台时的旧原文。
-    - 退出工作台前检测未写入 Mufy 的草稿，避免误退出丢失内容。
+    - 返回页面前曾检测未写入 Mufy 的草稿，避免误操作丢失内容。
     - Token 面板改为 300ms 防抖更新，降低超长字段编辑卡顿。
 
     V0.4.0 新增：草稿层 + Token 计数（步骤 2）
@@ -55,6 +70,7 @@
   var wbTokenTimer = null;
   var wbLastWriteUndo = null;
   var wbWritePending = false;
+  var wbSessionRoleId = '';
   var itemListExpanded = {};
   var wbItemExpanded = {};
 
@@ -489,6 +505,29 @@
     return null;
   }
 
+  function getCurrentRoleId() {
+    try {
+      var url = new URL(window.location.href);
+      return url.searchParams.get('roleId') || '';
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function hasActiveWorkbenchSession() {
+    return wbSnapshot.length > 0 && wbSessionRoleId === getCurrentRoleId();
+  }
+
+  function clearWorkbenchSession() {
+    clearWbTokenTimer();
+    wbLastWriteUndo = null;
+    wbWritePending = false;
+    wbCurrentIndex = -1;
+    wbSnapshot = [];
+    wbSessionRoleId = '';
+    wbItemExpanded = {};
+  }
+
   function buildWorkbenchItemEntities() {
     return buildItemEntities(
       wbSnapshot,
@@ -738,7 +777,7 @@
 
     wbEl.innerHTML = [
       '<div id="mufy-wb-topbar">',
-      '  <button id="mufy-wb-exit">← 退出工作台</button>',
+      '  <button id="mufy-wb-return" title="暂时收起工作台；本页未刷新前可继续编辑当前草稿。">← 返回 Mufy 页面</button>',
       '  <button id="mufy-wb-copy-llm" class="secondary">复制给 LLM</button>',
       '  <button id="mufy-wb-restore" class="secondary" title="放弃当前字段尚未写入 Mufy 的编辑，恢复到最近一次成功同步的版本。">还原当前字段草稿</button>',
       '  <span id="mufy-wb-title" class="wb-title">工作台</span>',
@@ -793,8 +832,8 @@
 
     document.body.appendChild(wbEl);
 
-    /* 退出 */
-    wbEl.querySelector('#mufy-wb-exit').addEventListener('click', function () {
+    /* 暂存返回 Mufy 页面（只隐藏工作台，不清空草稿） */
+    wbEl.querySelector('#mufy-wb-return').addEventListener('click', function () {
       closeWorkbench();
     });
 
@@ -868,6 +907,28 @@
   }
 
   function openWorkbench() {
+    var currentRoleId = getCurrentRoleId();
+
+    if (wbSnapshot.length > 0) {
+      if (hasActiveWorkbenchSession()) {
+        wbEl.classList.add('open');
+        renderWbFieldList();
+        selectWbField(wbCurrentIndex >= 0 ? wbCurrentIndex : 0);
+        updateWbWriteControls();
+        toast('已恢复本次工作台草稿');
+        return;
+      }
+
+      if (hasDirtyWbDrafts()) {
+        var confirmed = window.confirm('你正在切换到另一张角色卡。\n当前工作台有未写入 Mufy 的草稿，继续将丢弃这些草稿。是否继续？');
+        if (!confirmed) return;
+      }
+
+      clearWorkbenchSession();
+      scanFields();
+      renderList();
+    }
+
     var enabled = getEnabledFields();
     if (!enabled.length) {
       toast('当前没有勾选字段，请先在面板里勾选要编辑的字段');
@@ -886,6 +947,7 @@
         syncStatus: 'clean'
       };
     });
+    wbSessionRoleId = currentRoleId;
     wbCurrentIndex = -1;
     wbLastWriteUndo = null;
     wbWritePending = false;
@@ -1098,17 +1160,13 @@
   }
 
   function closeWorkbench() {
-    if (hasDirtyWbDrafts()) {
-      var confirmed = window.confirm('当前有未写入 Mufy 的草稿。退出后将丢失，确定退出吗？');
-      if (!confirmed) return;
+    var editor = wbEl && wbEl.querySelector('#mufy-wb-editor');
+    if (editor && wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
+      wbSnapshot[wbCurrentIndex].draftContent = editor.value;
     }
 
     clearWbTokenTimer();
-    wbLastWriteUndo = null;
-    wbWritePending = false;
     wbEl.classList.remove('open');
-    wbCurrentIndex = -1;
-    wbSnapshot = [];
   }
 
   var WB_DOT_COLOR = {
@@ -1809,7 +1867,7 @@
     if (!listEl) return;
 
     var title = panelEl ? panelEl.querySelector('#mufy-helper-header span') : null;
-    if (title) title.textContent = '🧩 Mufy 字段助手 V0.5.9';
+    if (title) title.textContent = '🧩 Mufy 字段助手 V0.5.10';
 
     listEl.innerHTML = '';
 
@@ -1857,7 +1915,7 @@
     panelEl.id = 'mufy-helper-panel';
     panelEl.innerHTML = [
       '<div id="mufy-helper-header">',
-      '<span>🧩 Mufy 字段助手 V0.5.9</span>',
+      '<span>🧩 Mufy 字段助手 V0.5.10</span>',
       '<span class="close">✕</span>',
       '</div>',
       '<div id="mufy-helper-toolbar">',
