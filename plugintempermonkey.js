@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         白厨Mufy字段编辑器
 // @namespace    mufy-card-helper
-// @version      0.5.20
+// @version      0.5.21
 // @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含物品聚合工作台、三态草稿层与安全单字段注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
@@ -309,6 +309,53 @@
     var cjkCount = (s.match(/[一-鿿㐀-䶿豈-﫿]/g) || []).length;
     var nonCjk = s.length - cjkCount;
     return cjkCount + Math.ceil(nonCjk / 4);
+  }
+
+  function readMufyNativeToken(field) {
+    if (!field || !field.el || !field.el.isConnected) return null;
+
+    var selector = 'textarea, input[type="text"], input:not([type]), [contenteditable="true"]';
+    var current = field.el.parentElement;
+
+    for (var depth = 0; depth < 9 && current; depth += 1) {
+      var edits = Array.from(current.querySelectorAll(selector));
+
+      if (edits.length === 1 && edits[0] === field.el) {
+        var nodes = Array.from(current.querySelectorAll('*'));
+
+        for (var n = 0; n < nodes.length; n += 1) {
+          var node = nodes[n];
+          if (node.querySelector(selector)) continue;
+
+          var match = asText(node.textContent).trim().match(/^token\s*:\s*([0-9][0-9,]*)$/i);
+          if (match) return Number(match[1].replace(/,/g, ''));
+        }
+      }
+
+      current = current.parentElement;
+    }
+
+    return null;
+  }
+
+  function getFieldTokenDisplay(field) {
+    var nativeToken = readMufyNativeToken(field);
+    if (nativeToken !== null) {
+      return {
+        value: nativeToken,
+        source: 'native',
+        text: nativeToken + ' tk',
+        title: 'Mufy 官方 token'
+      };
+    }
+
+    var estimated = estimateTokens(field && field.el ? getValue(field.el) : '');
+    return {
+      value: estimated,
+      source: 'estimated',
+      text: '≈' + estimated + ' tk',
+      title: '本地估算，等待 Mufy 官方 token'
+    };
   }
 
   function normalizeTrackedLabel(label) {
@@ -1779,6 +1826,19 @@
     }, 300);
   }
 
+  function refreshVisibleTokenDisplays() {
+    if (listEl) renderList();
+    if (wbEl && wbEl.classList.contains('open') && !wbCurrentInteraction && wbCurrentIndex >= 0) {
+      updateWbRightPanel();
+    }
+  }
+
+  function schedulePostWriteTokenRefresh() {
+    [200, 600, 1200].forEach(function (delay) {
+      window.setTimeout(refreshVisibleTokenDisplays, delay);
+    });
+  }
+
   function getCurrentWbSnap() {
     if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return null;
     return wbSnapshot[wbCurrentIndex];
@@ -1890,7 +1950,8 @@
         snap.syncedContent = expectedValue;
         snap.draftContent = expectedValue;
         snap.syncStatus = 'synced';
-        setWbWriteStatus('ok', '已回填到 Mufy 编辑页 · 请在 Mufy 点击”更新角色”保存');
+        setWbWriteStatus('ok', '已回填到 Mufy 编辑页 · 请在 Mufy 点击“更新角色”保存');
+        schedulePostWriteTokenRefresh();
       } else {
         snap.syncStatus = 'failed';
         setWbWriteStatus('err', '写入失败：延迟校验不一致');
@@ -3096,53 +3157,19 @@
   function updateWbRightPanel() {
     if (!wbEl || wbCurrentIndex < 0) return;
 
-    function findField(fieldId) {
-      for (var i = 0; i < fields.length; i += 1) {
-        if (fields[i].id === fieldId) return fields[i];
-      }
-      return null;
-    }
-
-    function readNativeToken(field) {
-      if (!field || !field.el || !field.el.isConnected) return null;
-
-      var selector = 'textarea, input[type="text"], input:not([type]), [contenteditable="true"]';
-      var current = field.el.parentElement;
-
-      for (var depth = 0; depth < 9 && current; depth += 1) {
-        var edits = Array.from(current.querySelectorAll(selector));
-
-        if (edits.length === 1 && edits[0] === field.el) {
-          var nodes = Array.from(current.querySelectorAll('*'));
-
-          for (var n = 0; n < nodes.length; n += 1) {
-            var node = nodes[n];
-            if (node.querySelector(selector)) continue;
-
-            var match = asText(node.textContent).trim().match(/^token\s*:\s*([0-9][0-9,]*)$/i);
-            if (match) return Number(match[1].replace(/,/g, ''));
-          }
-        }
-
-        current = current.parentElement;
-      }
-
-      return null;
-    }
-
     var snap = wbSnapshot[wbCurrentIndex];
-    var currentField = findField(snap.fieldId);
-    var currentNative = readNativeToken(currentField);
+    var currentField = findFieldById(snap.fieldId);
+    var currentNative = readMufyNativeToken(currentField);
     var draftChanged = snap.draftContent !== snap.syncedContent;
 
     wbEl.querySelector('#mufy-wb-orig-token').textContent =
       currentNative === null ? '未读取' : currentNative + ' token';
     wbEl.querySelector('#mufy-wb-draft-token').textContent = draftChanged
-      ? '待 Mufy 计数'
+      ? '待 Mufy 重计'
       : (currentNative === null ? '未读取' : currentNative + ' token');
 
     var deltaEl = wbEl.querySelector('#mufy-wb-token-delta');
-    deltaEl.textContent = draftChanged ? '草稿待注入确认' : '无变化';
+    deltaEl.textContent = draftChanged ? '草稿未回填' : '无变化';
     deltaEl.style.color = draftChanged ? '#fbbf24' : '#9a9aae';
 
     var list = wbEl.querySelector('#mufy-wb-tracked-list');
@@ -3164,7 +3191,7 @@
         }
       }
 
-      var tokens = readNativeToken(field);
+      var tokens = readMufyNativeToken(field);
       if (tokens === null) unread.push(label);
       else total += tokens;
 
@@ -3173,14 +3200,14 @@
       row.innerHTML =
         '<span class="wb-info-key wb-tracked-label" title="' + escapeHtml(label) + '">' +
         escapeHtml(label) + '</span>' +
-        '<span class="wb-info-val">' + (tokens === null ? '未读取' : tokens) + '</span>';
+        '<span class="wb-info-val">' + (tokens === null ? '未读取' : tokens + ' token') + '</span>';
       list.appendChild(row);
     });
 
     if (unread.length) {
       var note = document.createElement('div');
       note.style.cssText = 'font-size:10px;line-height:1.5;color:#fbbf24;margin-top:2px';
-      note.textContent = '缺少 ' + unread.length + ' 项原生读数：展开字段后重新扫描';
+      note.textContent = '已读取 ' + (TRACKED_FIELD_LABELS.length - unread.length) + ' / ' + TRACKED_FIELD_LABELS.length + ' 项，暂不显示精确合计';
       list.appendChild(note);
     }
 
@@ -3188,7 +3215,7 @@
     var bar = wbEl.querySelector('#mufy-wb-bar');
 
     if (unread.length) {
-      totalEl.textContent = '待读取 ' + unread.length + ' 项';
+      totalEl.textContent = '已读取 ' + (TRACKED_FIELD_LABELS.length - unread.length) + ' / ' + TRACKED_FIELD_LABELS.length + ' 项';
       totalEl.style.color = '#fbbf24';
       bar.style.width = '0%';
       bar.style.background = '#f59e0b';
@@ -3227,6 +3254,7 @@
       '.mufy-field-row.is-unconfirmed{background:rgba(245,158,11,.07)}',
       '.mufy-field-row input[type=text]{flex:1;min-width:150px;background:#2a2a38;border:1px solid #3f3f52;color:#fff;padding:4px 6px;border-radius:4px;font-size:12px}',
       '.mufy-field-row .len{font-size:11px;color:#9a9aae;min-width:42px;text-align:right}',
+      '.mufy-field-row .len.estimated{color:#6f6f86}',
       '.mufy-field-row button{background:#34344a;border:none;color:#cfcfe6;border-radius:4px;padding:3px 6px;font-size:11px;cursor:pointer}',
       '.mufy-field-meta{width:100%;padding-left:24px;font-size:11px;color:#8d8da4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
       '.mufy-field-badge{font-size:10px;padding:2px 5px;border-radius:999px;background:#244638;color:#a7f3d0;white-space:nowrap}',
@@ -3550,8 +3578,10 @@
     }
 
     var length = document.createElement('span');
-    length.className = 'len';
-    length.textContent = estimateTokens(getValue(field.el)) + ' tk';
+    var tokenDisplay = getFieldTokenDisplay(field);
+    length.className = 'len' + (tokenDisplay.source === 'estimated' ? ' estimated' : '');
+    length.textContent = tokenDisplay.text;
+    length.title = tokenDisplay.title;
 
     row.appendChild(buildFieldBadge(field));
     row.appendChild(length);
@@ -3783,7 +3813,7 @@
     if (!listEl) return;
 
     var title = panelEl ? panelEl.querySelector('#mufy-helper-header span') : null;
-    if (title) title.textContent = '🧩 白厨Mufy字段编辑器 V0.5.20';
+    if (title) title.textContent = '🧩 白厨Mufy字段编辑器 V0.5.21';
 
     listEl.innerHTML = '';
 
@@ -3838,7 +3868,7 @@
     panelEl.id = 'mufy-helper-panel';
     panelEl.innerHTML = [
       '<div id="mufy-helper-header">',
-      '<span class="mufy-panel-title">白厨Mufy字段编辑器 V0.5.20</span>',
+      '<span class="mufy-panel-title">白厨Mufy字段编辑器 V0.5.21</span>',
       '<button class="mufy-panel-help-btn" id="mufy-panel-help" title="帮助">?</button>',
       '<span class="close">✕</span>',
       '</div>',
@@ -4030,7 +4060,8 @@
       // Click (no drag)
       panelEl.classList.toggle('open');
       if (panelEl.classList.contains('open')) {
-        if (!fields.length) { scanFields(); renderList(); }
+        if (!fields.length) scanFields();
+        renderList();
         // Apply saved panel position
         if (uiPrefs.panelPosition) {
           panelEl.style.left = uiPrefs.panelPosition.left + 'px';
