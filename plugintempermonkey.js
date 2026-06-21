@@ -1906,6 +1906,12 @@
 
       listEl.appendChild(renderItemCard(entity));
     });
+
+    var selectAllBtn = panelEl && panelEl.querySelector('#mufy-helper-select-all');
+    if (selectAllBtn) {
+      selectAllBtn.textContent = (fields.length > 0 && fields.every(function (f) { return f.enabled; }))
+        ? '取消全选' : '全选';
+    }
   }
 
   /* ─── 面板构建 ─── */
@@ -1923,6 +1929,7 @@
       '<button data-act="copy">提取为 Markdown</button>',
       '<button data-act="workbench">进入工作台</button>',
       '<button class="secondary" data-act="toggle-paste">粘贴 AI 结果</button>',
+      '<button class="secondary" id="mufy-helper-select-all">全选</button>',
       '</div>',
       '<div id="mufy-helper-list"></div>',
       '<div id="mufy-helper-paste">',
@@ -1977,6 +1984,19 @@
       }
       panelEl.classList.remove('open');
       openWorkbench();
+    });
+
+    var selectAllBtn = panelEl.querySelector('#mufy-helper-select-all');
+    function updateSelectAllLabel() {
+      var allOn = fields.length > 0 && fields.every(function (f) { return f.enabled; });
+      selectAllBtn.textContent = allOn ? '取消全选' : '全选';
+    }
+    selectAllBtn.addEventListener('click', function () {
+      if (!fields.length) { toast('请先扫描字段'); return; }
+      var allOn = fields.every(function (f) { return f.enabled; });
+      fields.forEach(function (f) { f.enabled = !allOn; });
+      renderList();
+      updateSelectAllLabel();
     });
 
     var pasteBox = panelEl.querySelector('#mufy-helper-paste');
