@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.5.2
-// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、三态草稿层与单字段手动注入
+// @version      0.5.3
+// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、三态草稿层与安全单字段注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
 // ==/UserScript==
@@ -655,7 +655,7 @@
       '  <div id="mufy-wb-right">',
       '    <div class="wb-section-title">当前字段</div>',
       '    <div class="wb-info-row">',
-      '      <span class="wb-info-key">原文</span>',
+      '      <span class="wb-info-key">Mufy 当前</span>',
       '      <span id="mufy-wb-orig-token" class="wb-info-val">—</span>',
       '    </div>',
       '    <div class="wb-info-row">',
@@ -723,7 +723,7 @@
       setWbWriteStatus('', '');
       renderWbFieldList();
       updateWbRightPanel();
-      toast('已恢复"' + snap.label + '"的初始内容');
+      toast('已将"' + snap.label + '"还原至当前同步版本');
     });
 
     /* 放弃草稿：draft → syncedContent（V0.6.2 引入 LLM 回填后两者语义会分化） */
@@ -736,7 +736,7 @@
       setWbWriteStatus('', '');
       renderWbFieldList();
       updateWbRightPanel();
-      toast('已放弃"' + snap.label + '"的草稿，恢复原始内容');
+      toast('已放弃"' + snap.label + '"的草稿，恢复至当前同步版本');
     });
 
     /* 写入当前字段到 Mufy */
@@ -849,7 +849,7 @@
       if (written === snap.draftContent) {
         snap.syncedContent = snap.draftContent;  // 更新同步基线；entryContent 保持进入时原文不变
         snap.syncStatus = 'synced';
-        setWbWriteStatus('ok', '已同步到 Mufy ✓');
+        setWbWriteStatus('ok', '已填入 Mufy 编辑器 ✓ 请手动点击“更新角色”保存');
       } else {
         snap.syncStatus = 'failed';
         setWbWriteStatus('err', '写入失败：内容校验不一致');
@@ -1249,7 +1249,7 @@
     panelEl.id = 'mufy-helper-panel';
     panelEl.innerHTML = [
       '<div id="mufy-helper-header">',
-      '<span>🧩 Mufy 字段助手 V0.5.0</span>',
+      '<span>🧩 Mufy 字段助手 V0.5.3</span>',
       '<span class="close">✕</span>',
       '</div>',
       '<div id="mufy-helper-toolbar">',
@@ -1453,7 +1453,7 @@
   }
 
   /* ─── 初始化 ─── */
-  /* ─── V0.5.1｜单字段注入安全补丁 ─── */
+  /* ─── V0.5.3｜单字段注入安全层 ─── */
 
   var wbLastWriteUndo = null;
   var wbWritePending = false;
@@ -1531,7 +1531,7 @@
       : null;
 
     if (helperTitle) {
-      helperTitle.textContent = '🧩 Mufy 字段助手 V0.5.1';
+      helperTitle.textContent = '🧩 Mufy 字段助手 V0.5.3';
     }
 
     var row = wbEl.querySelector('#mufy-wb-write-row');
@@ -1544,7 +1544,7 @@
       undoButton.className = 'secondary';
       undoButton.type = 'button';
       undoButton.disabled = true;
-      undoButton.textContent = '撤销本次写入';
+      undoButton.textContent = '撤回编辑页写入';
 
       row.insertBefore(undoButton, status || null);
 
