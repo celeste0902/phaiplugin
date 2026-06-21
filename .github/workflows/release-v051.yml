@@ -1,0 +1,29 @@
+name: Release Mufy Editor Helper v0.5.1
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/release-v051.trigger'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          persist-credentials: true
+      - run: python3 scripts/release_v051_workbench_safety.py
+      - run: |
+          rm -f .github/release-v051.trigger .github/workflows/release-v051.yml scripts/release_v051_workbench_safety.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "release: Mufy 角色卡编辑助手 v0.5.1"
+          git push origin HEAD:master
