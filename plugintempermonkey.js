@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.4.0
-// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台 + 草稿层 + Token 计数
+// @version      0.4.1
+// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、草稿保护与 Token 预算
 // @match        https://chat.mufy.ai/create*
 // @grant        none
 // ==/UserScript==
@@ -11,6 +11,12 @@
   'use strict';
 
   /*
+    V0.4.1 修复：草稿导出、退出保护与 Token 统计性能
+    - “人设”纳入关键字段 Token 合计。
+    - 复制给 LLM 改为导出当前草稿，不再回退到进入工作台时的旧原文。
+    - 退出工作台前检测未写入 Mufy 的草稿，避免误退出丢失内容。
+    - Token 面板改为 300ms 防抖更新，降低超长字段编辑卡顿。
+
     V0.4.0 新增：草稿层 + Token 计数（步骤 2）
     - wbSnapshot 条目增加 draftContent，切换字段时自动保存草稿。
     - 恢复初始版本：draft → original（不触碰 Mufy DOM）。
@@ -22,7 +28,7 @@
   */
 
   /* ─── 关键字段关键词（用于 Token 合计统计） ─── */
-  var TRACKED_KEYWORDS = ['角色设定', '开场设计', '输出设定', '情节设定', '样例对话', '文风'];
+  var TRACKED_KEYWORDS = ['人设', '角色设定', '开场设计', '输出设定', '情节设定', '样例对话', '文风'];
   var TOKEN_LIMIT = 20090;
 
   /* ─── 全局状态 ─── */
@@ -37,6 +43,8 @@
   var wbCurrentIndex = -1;
   // wbSnapshot 条目：{ label, originalContent, draftContent }
   var wbSnapshot = [];
+  // 右侧 Token 面板防抖计时器，避免超长字段每次按键都全量重算。
+  var wbTokenTimer = null;
 
   /* ─── 工具函数 ─── */
 
@@ -617,7 +625,7 @@
       '      <span id="mufy-wb-token-delta" class="wb-info-val">—</span>',
       '    </div>',
       '    <div class="wb-divider"></div>',
-      '    <div class="wb-section-title">关键字段合计</div>',
+      '    <div class="wb-section-title">本次已选关键字段合计</div>',
       '    <div id="mufy-wb-tracked-list"></div>',
       '    <div class="wb-divider"></div>',
       '    <div class="wb-info-row wb-total-row">',
@@ -643,7 +651,7 @@
       closeWorkbench();
     });
 
-    /* 复制给 LLM：使用原文快照内容（originalContent），方便发给 LLM 改写 */
+    /* 复制给 LLM：导出当前草稿（draftContent），保留本次工作台的最新编辑。 */
     wbEl.querySelector('#mufy-wb-copy-llm').addEventListener('click', function () {
       if (!wbSnapshot.length) {
         toast('工作台里没有字段');
@@ -656,10 +664,10 @@
         ''
       ].join('\n');
       var body = wbSnapshot.map(function (snap) {
-        return '## ' + snap.label + '\n\n' + snap.originalContent + '\n';
+        return '## ' + snap.label + '\n\n' + snap.draftContent + '\n';
       }).join('\n');
       copyText(header + '\n' + body).then(function (ok) {
-        toast(ok ? '已复制工作台字段（原文），可粘贴给 LLM' : '复制失败，请手动选择文本');
+        toast(ok ? '已复制工作台字段（当前草稿），可粘贴给 LLM' : '复制失败，请手动选择文本');
       });
     });
 
@@ -688,7 +696,7 @@
       if (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
         wbSnapshot[wbCurrentIndex].draftContent = wbEl.querySelector('#mufy-wb-editor').value;
       }
-      updateWbRightPanel();
+      scheduleWbRightPanelUpdate();
     });
   }
 
@@ -713,7 +721,35 @@
     selectWbField(0);
   }
 
+  function hasDirtyWbDrafts() {
+    return wbSnapshot.some(function (snap) {
+      return snap.draftContent !== snap.originalContent;
+    });
+  }
+
+  function clearWbTokenTimer() {
+    if (!wbTokenTimer) return;
+    window.clearTimeout(wbTokenTimer);
+    wbTokenTimer = null;
+  }
+
+  function scheduleWbRightPanelUpdate() {
+    clearWbTokenTimer();
+    wbTokenTimer = window.setTimeout(function () {
+      wbTokenTimer = null;
+      if (wbEl && wbEl.classList.contains('open') && wbCurrentIndex >= 0) {
+        updateWbRightPanel();
+      }
+    }, 300);
+  }
+
   function closeWorkbench() {
+    if (hasDirtyWbDrafts()) {
+      var confirmed = window.confirm('当前有未写入 Mufy 的草稿。退出后将丢失，确定退出吗？');
+      if (!confirmed) return;
+    }
+
+    clearWbTokenTimer();
     wbEl.classList.remove('open');
     wbCurrentIndex = -1;
     wbSnapshot = [];
@@ -738,6 +774,7 @@
   function selectWbField(index) {
     if (index < 0 || index >= wbSnapshot.length) return;
 
+    clearWbTokenTimer();
     var editor = wbEl.querySelector('#mufy-wb-editor');
 
     // 切换前先把编辑器内容存入当前字段的草稿
