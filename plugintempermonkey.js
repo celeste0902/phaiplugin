@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.5.5
-// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、三态草稿层与安全单字段注入
+// @version      0.5.6
+// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含物品聚合扫描、全屏工作台、三态草稿层与安全单字段注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
 // ==/UserScript==
@@ -1778,6 +1778,368 @@
     updateWbWriteControlsV051();
 
     return result;
+  };
+
+    /* ─── V0.5.6｜物品聚合扫描补丁 ─── */
+  /*
+    仅重做浮动面板的扫描呈现：
+    - 同一件物品的名称 / 描述归为一个物品卡。
+    - 勾选物品卡 = 勾选该物品当前已扫描到的全部基础字段。
+    - 展开后才显示名称、描述等原子字段；底层写入仍沿用既有字段链路。
+    - 交互弹窗字段暂不强行扫描，避免把未打开的弹窗误判为空。
+  */
+
+  var itemGroupExpanded = {};
+  var v055ScanFieldsForItemGrouping = scanFields;
+
+  function isV056ItemField(field) {
+    return !!(field && field.group && field.group.indexOf('物品｜') === 0);
+  }
+
+  function ensureV056ItemGroupingStyle() {
+    if (document.getElementById('mufy-v056-item-grouping-style')) return;
+
+    var style = document.createElement('style');
+    style.id = 'mufy-v056-item-grouping-style';
+    style.textContent = [
+      '.mufy-item-section{margin:8px 0 4px;padding:7px 8px;border-radius:6px;background:#242238;color:#cfc9ff;font-size:11px;font-weight:600}',
+      '.mufy-item-section small{margin-left:6px;color:#8f8aac;font-weight:400}',
+      '.mufy-item-card{margin:6px 0;border:1px solid #3b355a;border-radius:8px;background:#1f1f2b;overflow:hidden}',
+      '.mufy-item-card-head{display:flex;align-items:center;gap:7px;padding:8px;background:#2a273d}',
+      '.mufy-item-card-name{flex:1;min-width:0;color:#f0ecff;font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.mufy-item-card-summary{font-size:10px;color:#aaa4ce;white-space:nowrap}',
+      '.mufy-item-card-toggle{background:#403a60!important;color:#e5dfff!important;border:none;border-radius:5px;padding:3px 7px!important;font-size:10px!important;cursor:pointer}',
+      '.mufy-item-card-note{padding:0 9px 8px;color:#8f8ba4;font-size:10px;line-height:1.5}',
+      '.mufy-item-card-children{border-top:1px solid #37324f;padding:0 5px 4px}',
+      '.mufy-item-child-row{padding-left:8px!important;border-bottom-color:#302d42!important}',
+      '.mufy-item-child-label{flex:1;min-width:110px;color:#cbc6e7;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
+    ].join('');
+    document.head.appendChild(style);
+  }
+
+  function v056AssignUniqueItemGroups() {
+    var countByBase = {};
+    var active = null;
+
+    fields.forEach(function (field) {
+      if (field.role === '名称' && isV056ItemField(field)) {
+        var base = field.group;
+        countByBase[base] = (countByBase[base] || 0) + 1;
+
+        var uniqueGroup = base;
+        if (countByBase[base] > 1) {
+          uniqueGroup = base + '（#' + countByBase[base] + '）';
+        }
+
+        field.group = uniqueGroup;
+        field.label = uniqueGroup + '｜名称';
+        active = {
+          oldGroup: base,
+          uniqueGroup: uniqueGroup
+        };
+        return;
+      }
+
+      if (field.role === '描述' && active && field.group === active.oldGroup) {
+        field.group = active.uniqueGroup;
+        field.label = active.uniqueGroup + '｜描述';
+        active = null;
+        return;
+      }
+
+      if (!isV056ItemField(field)) active = null;
+    });
+  }
+
+  scanFields = function () {
+    itemGroupExpanded = {};
+
+    var result = v055ScanFieldsForItemGrouping.apply(this, arguments);
+
+    v056AssignUniqueItemGroups();
+
+    return result;
+  };
+
+  function getV056ItemEntities() {
+    var byKey = {};
+    var entities = [];
+
+    fields.forEach(function (field) {
+      if (!isV056ItemField(field)) return;
+
+      if (!byKey[field.group]) {
+        byKey[field.group] = {
+          key: field.group,
+          name: field.group.replace(/^物品｜/, ''),
+          fields: []
+        };
+        entities.push(byKey[field.group]);
+      }
+
+      byKey[field.group].fields.push(field);
+    });
+
+    return entities;
+  }
+
+  function getV056ItemSelection(entity) {
+    var enabledCount = entity.fields.filter(function (field) {
+      return field.enabled;
+    }).length;
+
+    return {
+      enabledCount: enabledCount,
+      all: entity.fields.length > 0 && enabledCount === entity.fields.length,
+      mixed: enabledCount > 0 && enabledCount < entity.fields.length
+    };
+  }
+
+  function buildV056Badge(field) {
+    var badge = document.createElement('span');
+    var status = getFieldStatus(field);
+
+    badge.textContent = status;
+    badge.className = 'mufy-field-badge';
+
+    if (status === '已分组') badge.className += ' inferred';
+    if (status === '未识别' || status === '需确认') {
+      badge.className += ' unconfirmed';
+    }
+
+    return badge;
+  }
+
+  function bindV056Rebind(field) {
+    var button = document.createElement('button');
+
+    button.textContent = '本次重绑';
+    button.title = '仅在本次页面会话内生效，刷新或重新扫描后会失效';
+
+    button.addEventListener('click', function () {
+      toast('请直接点击页面上的输入框本体（Esc 取消）');
+
+      panelEl.classList.remove('open');
+
+      startPicker(function (target) {
+        field.el = target;
+        field.type = getFieldType(target);
+        field.isUnrecognized = false;
+        field.needsReview = false;
+        field.isInferred = false;
+        field.enabled = true;
+
+        panelEl.classList.add('open');
+        renderList();
+
+        toast('"' + field.label + '"本次重绑成功');
+      });
+    });
+
+    return button;
+  }
+
+  function buildV056FieldRow(field, compact) {
+    var row = document.createElement('div');
+
+    row.className = 'mufy-field-row' +
+      (compact ? ' mufy-item-child-row' : '') +
+      (field.isUnrecognized || field.needsReview ? ' is-unconfirmed' : '');
+
+    var checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = field.enabled;
+
+    checkbox.addEventListener('change', function () {
+      field.enabled = checkbox.checked;
+
+      if (compact) renderList();
+    });
+
+    row.appendChild(checkbox);
+
+    if (compact) {
+      var childLabel = document.createElement('span');
+
+      childLabel.className = 'mufy-item-child-label';
+      childLabel.textContent = field.role || field.label;
+      childLabel.title = field.label;
+
+      row.appendChild(childLabel);
+    } else {
+      var nameInput = document.createElement('input');
+
+      nameInput.type = 'text';
+      nameInput.value = field.label;
+      nameInput.title = '可修改本次会话中的导出标题；重新扫描后会恢复自动识别';
+
+      nameInput.addEventListener('change', function () {
+        var nextLabel = nameInput.value.trim();
+
+        if (!nextLabel) {
+          nameInput.value = field.label;
+          return;
+        }
+
+        field.label = nextLabel;
+        field.manualName = true;
+        field.isUnrecognized = false;
+        field.needsReview = false;
+        field.isInferred = false;
+
+        renderList();
+      });
+
+      row.appendChild(nameInput);
+    }
+
+    var length = document.createElement('span');
+
+    length.className = 'len';
+    length.textContent = estimateTokens(getValue(field.el)) + ' tk';
+
+    row.appendChild(buildV056Badge(field));
+    row.appendChild(length);
+    row.appendChild(bindV056Rebind(field));
+
+    if (!compact) {
+      var meta = document.createElement('div');
+
+      meta.className = 'mufy-field-meta';
+      meta.textContent = getFieldMeta(field);
+      meta.title = meta.textContent;
+
+      row.appendChild(meta);
+    }
+
+    return row;
+  }
+
+  function buildV056ItemCard(entity) {
+    var card = document.createElement('div');
+    card.className = 'mufy-item-card';
+
+    var head = document.createElement('div');
+    head.className = 'mufy-item-card-head';
+
+    var selection = getV056ItemSelection(entity);
+
+    var checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = selection.all;
+    checkbox.indeterminate = selection.mixed;
+    checkbox.title = '勾选或取消勾选这件物品当前已扫描到的全部基础字段';
+
+    checkbox.addEventListener('change', function () {
+      entity.fields.forEach(function (field) {
+        field.enabled = checkbox.checked;
+      });
+
+      renderList();
+    });
+
+    var name = document.createElement('span');
+
+    name.className = 'mufy-item-card-name';
+    name.textContent = '物品｜' + entity.name;
+    name.title = entity.key;
+
+    var summary = document.createElement('span');
+
+    summary.className = 'mufy-item-card-summary';
+    summary.textContent = '基础字段 ' + entity.fields.length + ' 项';
+
+    var toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'mufy-item-card-toggle';
+
+    var expanded = !!itemGroupExpanded[entity.key];
+
+    toggle.textContent = expanded ? '收起' : '展开';
+
+    toggle.addEventListener('click', function () {
+      itemGroupExpanded[entity.key] = !itemGroupExpanded[entity.key];
+
+      renderList();
+    });
+
+    head.appendChild(checkbox);
+    head.appendChild(name);
+    head.appendChild(summary);
+    head.appendChild(toggle);
+
+    card.appendChild(head);
+
+    var note = document.createElement('div');
+
+    note.className = 'mufy-item-card-note';
+    note.textContent = '交互提示词与使用后文案尚未采集；请打开对应交互编辑窗后再扫描。';
+
+    card.appendChild(note);
+
+    if (expanded) {
+      var children = document.createElement('div');
+
+      children.className = 'mufy-item-card-children';
+
+      entity.fields.forEach(function (field) {
+        children.appendChild(buildV056FieldRow(field, true));
+      });
+
+      card.appendChild(children);
+    }
+
+    return card;
+  }
+
+  renderList = function () {
+    if (!listEl) return;
+
+    ensureV056ItemGroupingStyle();
+
+    var title = panelEl
+      ? panelEl.querySelector('#mufy-helper-header span')
+      : null;
+
+    if (title) title.textContent = '🧩 Mufy 字段助手 V0.5.6';
+
+    listEl.innerHTML = '';
+
+    var items = getV056ItemEntities();
+    var entityByKey = {};
+
+    items.forEach(function (entity) {
+      entityByKey[entity.key] = entity;
+    });
+
+    var renderedItemKeys = {};
+    var itemHeaderAdded = false;
+
+    fields.forEach(function (field) {
+      if (isV056ItemField(field)) {
+        if (!itemHeaderAdded) {
+          var section = document.createElement('div');
+
+          section.className = 'mufy-item-section';
+          section.innerHTML =
+            '物品栏<small>' +
+            items.length +
+            ' 件物品已聚合；交互弹窗需单独采集</small>';
+
+          listEl.appendChild(section);
+
+          itemHeaderAdded = true;
+        }
+
+        if (renderedItemKeys[field.group]) return;
+
+        renderedItemKeys[field.group] = true;
+        listEl.appendChild(buildV056ItemCard(entityByKey[field.group]));
+        return;
+      }
+
+      listEl.appendChild(buildV056FieldRow(field, false));
+    });
   };
   
   function init() {
