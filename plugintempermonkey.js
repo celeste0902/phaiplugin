@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.4.3
-// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、草稿保护与 Mufy 原生 Token 预算
+// @version      0.5.0
+// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、草稿层与单字段手动注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
 // ==/UserScript==
@@ -11,6 +11,14 @@
   'use strict';
 
   /*
+    V0.5.0 新增：单字段手动注入 Mufy（步骤 3）
+    - 编辑器下方新增"写入当前字段到 Mufy"按钮。
+    - 写入前检查 el.isConnected，失败给明确提示（已卸载 / 写入失败 / 校验不一致）。
+    - 写入成功后 originalContent 更新为 draftContent，hasDirtyWbDrafts 随之更新。
+    - wbSnapshot 每条增加 syncStatus：clean / dirty / synced / failed / stale。
+    - 左侧字段列表显示彩色圆点反映同步状态。
+    - 切换字段时自动恢复该字段的写入状态提示。
+
     V0.4.1 修复：草稿导出、退出保护与 Token 统计性能
     - “人设”纳入关键字段 Token 合计。
     - 复制给 LLM 改为导出当前草稿，不再回退到进入工作台时的旧原文。
@@ -639,6 +647,10 @@
       '  <div id="mufy-wb-center">',
       '    <div id="mufy-wb-center-label"></div>',
       '    <textarea id="mufy-wb-editor" placeholder="从左侧选择一个字段…"></textarea>',
+      '    <div id="mufy-wb-write-row">',
+      '      <button id="mufy-wb-write-btn">写入当前字段到 Mufy</button>',
+      '      <span id="mufy-wb-write-status"></span>',
+      '    </div>',
       '  </div>',
       '  <div id="mufy-wb-right">',
       '    <div class="wb-section-title">当前字段</div>',
@@ -701,30 +713,55 @@
       });
     });
 
-    /* 恢复初始版本：draft → original，更新编辑器 */
+    /* 恢复初始版本：draft → original，清除同步状态 */
     wbEl.querySelector('#mufy-wb-restore').addEventListener('click', function () {
       if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return;
       var snap = wbSnapshot[wbCurrentIndex];
       snap.draftContent = snap.originalContent;
+      snap.syncStatus = 'clean';
       wbEl.querySelector('#mufy-wb-editor').value = snap.originalContent;
+      setWbWriteStatus('', '');
+      renderWbFieldList();
       updateWbRightPanel();
       toast('已恢复"' + snap.label + '"的初始内容');
     });
 
-    /* 放弃草稿：效果同恢复初始版本（步骤 2 语义相同，步骤 6 引入 LLM 回填后会有差异） */
+    /* 放弃草稿：效果同恢复初始版本（步骤 6 引入 LLM 回填后两者语义会分化） */
     wbEl.querySelector('#mufy-wb-discard').addEventListener('click', function () {
       if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return;
       var snap = wbSnapshot[wbCurrentIndex];
       snap.draftContent = snap.originalContent;
+      snap.syncStatus = 'clean';
       wbEl.querySelector('#mufy-wb-editor').value = snap.originalContent;
+      setWbWriteStatus('', '');
+      renderWbFieldList();
       updateWbRightPanel();
       toast('已放弃"' + snap.label + '"的草稿，恢复原始内容');
     });
 
-    /* 编辑器实时保存草稿 + 更新右侧 */
+    /* 写入当前字段到 Mufy */
+    wbEl.querySelector('#mufy-wb-write-btn').addEventListener('click', function () {
+      writeCurrentFieldToMufy();
+    });
+
+    /* 编辑器实时保存草稿 + 更新 syncStatus + 更新右侧 */
     wbEl.querySelector('#mufy-wb-editor').addEventListener('input', function () {
       if (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
-        wbSnapshot[wbCurrentIndex].draftContent = wbEl.querySelector('#mufy-wb-editor').value;
+        var snap = wbSnapshot[wbCurrentIndex];
+        snap.draftContent = wbEl.querySelector('#mufy-wb-editor').value;
+
+        var isDirty = snap.draftContent !== snap.originalContent;
+        var prevStatus = snap.syncStatus;
+
+        if (isDirty && prevStatus !== 'dirty') {
+          snap.syncStatus = 'dirty';
+          renderWbFieldList();
+        } else if (!isDirty && prevStatus === 'dirty') {
+          // Draft reverted back to match original
+          snap.syncStatus = 'clean';
+          setWbWriteStatus('', '');
+          renderWbFieldList();
+        }
       }
       scheduleWbRightPanelUpdate();
     });
@@ -743,7 +780,9 @@
         fieldId: field.id,
         label: field.label,
         originalContent: content,
-        draftContent: content
+        draftContent: content,
+        // syncStatus: clean | dirty | synced | failed | stale
+        syncStatus: 'clean'
       };
     });
     wbCurrentIndex = -1;
@@ -774,6 +813,62 @@
     }, 300);
   }
 
+  /* 把当前字段的草稿写入 Mufy 对应 DOM 节点（约束 4：写前检查 isConnected） */
+  function writeCurrentFieldToMufy() {
+    if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return;
+
+    var snap = wbSnapshot[wbCurrentIndex];
+
+    // 先把编辑器最新值存入 draft
+    var editor = wbEl.querySelector('#mufy-wb-editor');
+    snap.draftContent = editor.value;
+
+    // 按 fieldId 找回原始 DOM 节点
+    var field = null;
+    for (var i = 0; i < fields.length; i += 1) {
+      if (fields[i].id === snap.fieldId) { field = fields[i]; break; }
+    }
+
+    if (!field || !field.el || !field.el.isConnected) {
+      snap.syncStatus = 'stale';
+      setWbWriteStatus('err', '字段已卸载，请重新扫描');
+      renderWbFieldList();
+      return;
+    }
+
+    try {
+      if (field.type === 'contenteditable') {
+        setEditableValue(field.el, snap.draftContent);
+      } else {
+        setNativeValue(field.el, snap.draftContent);
+      }
+
+      // 校验是否真的写进去了
+      var written = getValue(field.el);
+      if (written === snap.draftContent) {
+        snap.originalContent = snap.draftContent;  // Mufy 已同步，更新基线
+        snap.syncStatus = 'synced';
+        setWbWriteStatus('ok', '已同步到 Mufy ✓');
+      } else {
+        snap.syncStatus = 'failed';
+        setWbWriteStatus('err', '写入失败：内容校验不一致');
+      }
+    } catch (err) {
+      snap.syncStatus = 'failed';
+      setWbWriteStatus('err', '写入失败：' + (err && err.message ? err.message : '未知错误'));
+    }
+
+    renderWbFieldList();
+    scheduleWbRightPanelUpdate();
+  }
+
+  function setWbWriteStatus(type, message) {
+    var el = wbEl && wbEl.querySelector('#mufy-wb-write-status');
+    if (!el) return;
+    el.textContent = message;
+    el.className = type;  // 'ok' | 'err' | 'warn' | ''
+  }
+
   function closeWorkbench() {
     if (hasDirtyWbDrafts()) {
       var confirmed = window.confirm('当前有未写入 Mufy 的草稿。退出后将丢失，确定退出吗？');
@@ -786,19 +881,47 @@
     wbSnapshot = [];
   }
 
+  var WB_DOT_COLOR = {
+    clean:  '#4a4a62',
+    dirty:  '#fbbf24',
+    synced: '#4ade80',
+    failed: '#f87171',
+    stale:  '#f87171'
+  };
+
   function renderWbFieldList() {
     var fieldListEl = wbEl.querySelector('#mufy-wb-field-list');
     fieldListEl.innerHTML = '';
     wbSnapshot.forEach(function (snap, index) {
       var item = document.createElement('div');
       item.className = 'mufy-wb-field-item';
-      item.textContent = snap.label;
-      item.title = snap.label;
       item.dataset.index = index;
+
+      // 彩色圆点：反映同步状态
+      var dot = document.createElement('span');
+      dot.className = 'mufy-wb-dot';
+      dot.style.background = WB_DOT_COLOR[snap.syncStatus] || '#4a4a62';
+      dot.title = snap.syncStatus;
+
+      var label = document.createElement('span');
+      label.textContent = snap.label;
+      label.style.overflow = 'hidden';
+      label.style.textOverflow = 'ellipsis';
+      label.style.whiteSpace = 'nowrap';
+
+      item.title = snap.label;
+      item.appendChild(dot);
+      item.appendChild(label);
+
       item.addEventListener('click', function () {
         selectWbField(index);
       });
       fieldListEl.appendChild(item);
+    });
+
+    // 更新当前选中高亮
+    fieldListEl.querySelectorAll('.mufy-wb-field-item').forEach(function (item) {
+      item.classList.toggle('active', Number(item.dataset.index) === wbCurrentIndex);
     });
   }
 
@@ -824,6 +947,17 @@
     wbEl.querySelectorAll('.mufy-wb-field-item').forEach(function (item) {
       item.classList.toggle('active', Number(item.dataset.index) === index);
     });
+
+    // 恢复该字段的写入状态提示
+    if (snap.syncStatus === 'synced') {
+      setWbWriteStatus('ok', '已同步到 Mufy ✓');
+    } else if (snap.syncStatus === 'failed') {
+      setWbWriteStatus('err', '写入失败');
+    } else if (snap.syncStatus === 'stale') {
+      setWbWriteStatus('err', '字段已卸载，请重新扫描');
+    } else {
+      setWbWriteStatus('', '');
+    }
 
     updateWbRightPanel();
     editor.focus();
@@ -994,14 +1128,22 @@
       '#mufy-wb-body{flex:1;display:flex;overflow:hidden}',
 
       '#mufy-wb-left{width:210px;min-width:210px;border-right:1px solid #222236;overflow-y:auto;background:#161622;flex-shrink:0}',
-      '.mufy-wb-field-item{padding:11px 16px;cursor:pointer;border-bottom:1px solid #1c1c2e;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#b0b0cc;transition:background .12s}',
+      '.mufy-wb-field-item{padding:9px 12px;cursor:pointer;border-bottom:1px solid #1c1c2e;font-size:13px;color:#b0b0cc;transition:background .12s;display:flex;align-items:center;gap:8px;overflow:hidden}',
       '.mufy-wb-field-item:hover{background:#1e1e32}',
-      '.mufy-wb-field-item.active{background:#28194a;color:#c4b5fd;border-left:3px solid #8b5cf6;padding-left:13px}',
+      '.mufy-wb-field-item.active{background:#28194a;color:#c4b5fd;border-left:3px solid #8b5cf6;padding-left:9px}',
+      '.mufy-wb-dot{width:7px;height:7px;min-width:7px;border-radius:50%;display:inline-block}',
 
       '#mufy-wb-center{flex:1;display:flex;flex-direction:column;padding:16px;gap:8px;overflow:hidden}',
-      '#mufy-wb-center-label{font-size:12px;color:#6b6b8a;padding-bottom:6px;border-bottom:1px solid #222236}',
+      '#mufy-wb-center-label{font-size:12px;color:#6b6b8a;padding-bottom:6px;border-bottom:1px solid #222236;flex-shrink:0}',
       '#mufy-wb-editor{flex:1;width:100%;background:#1b1b28;color:#e6e6ef;border:1px solid #333350;border-radius:8px;padding:14px;font-size:14px;line-height:1.85;resize:none;box-sizing:border-box;font-family:inherit;outline:none}',
       '#mufy-wb-editor:focus{border-color:#8b5cf6}',
+      '#mufy-wb-write-row{display:flex;align-items:center;gap:10px;flex-shrink:0}',
+      '#mufy-wb-write-btn{background:#059669;border:none;color:#fff;padding:8px 18px;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap}',
+      '#mufy-wb-write-btn:hover{filter:brightness(1.12)}',
+      '#mufy-wb-write-status{font-size:12px;color:#9a9aae}',
+      '#mufy-wb-write-status.ok{color:#4ade80}',
+      '#mufy-wb-write-status.err{color:#f87171}',
+      '#mufy-wb-write-status.warn{color:#fbbf24}',
 
       '#mufy-wb-right{width:210px;min-width:210px;border-left:1px solid #222236;padding:14px 12px;overflow-y:auto;background:#161622;flex-shrink:0;display:flex;flex-direction:column;gap:8px;font-size:12px}',
       '.wb-section-title{font-size:10px;color:#5a5a7a;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px;margin-top:4px}',
@@ -1106,7 +1248,7 @@
     panelEl.id = 'mufy-helper-panel';
     panelEl.innerHTML = [
       '<div id="mufy-helper-header">',
-      '<span>🧩 Mufy 字段助手 V0.4.0</span>',
+      '<span>🧩 Mufy 字段助手 V0.5.0</span>',
       '<span class="close">✕</span>',
       '</div>',
       '<div id="mufy-helper-toolbar">',
