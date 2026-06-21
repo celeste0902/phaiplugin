@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.5.0
+// @version      0.5.1
 // @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、草稿层与单字段手动注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
@@ -1452,7 +1452,347 @@
   }
 
   /* ─── 初始化 ─── */
+  /* ─── V0.5.1｜单字段注入安全补丁 ─── */
 
+  var wbLastWriteUndo = null;
+  var wbWritePending = false;
+
+  var v050OpenWorkbench = openWorkbench;
+  var v050CloseWorkbench = closeWorkbench;
+  var v050SelectWbField = selectWbField;
+
+  function getCurrentWbSnapV051() {
+    if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return null;
+    return wbSnapshot[wbCurrentIndex];
+  }
+
+  function getWbFieldByIdV051(fieldId) {
+    for (var i = 0; i < fields.length; i += 1) {
+      if (fields[i].id === fieldId) return fields[i];
+    }
+    return null;
+  }
+
+  function injectV051Style() {
+    if (document.getElementById('mufy-v051-style')) return;
+
+    var style = document.createElement('style');
+    style.id = 'mufy-v051-style';
+    style.textContent = [
+      '#mufy-wb-undo-write-btn{background:#34344a;border:none;color:#e6e6ef;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap}',
+      '#mufy-wb-write-btn:disabled,#mufy-wb-undo-write-btn:disabled{cursor:not-allowed;opacity:.45;filter:none}'
+    ].join('');
+
+    document.head.appendChild(style);
+  }
+
+  function clearWbUndoV051(fieldId) {
+    if (wbLastWriteUndo && wbLastWriteUndo.fieldId === fieldId) {
+      wbLastWriteUndo = null;
+    }
+  }
+
+  function updateWbWriteControlsV051() {
+    if (!wbEl) return;
+
+    var snap = getCurrentWbSnapV051();
+    var writeButton = wbEl.querySelector('#mufy-wb-write-btn');
+    var undoButton = wbEl.querySelector('#mufy-wb-undo-write-btn');
+
+    if (writeButton) {
+      writeButton.disabled = wbWritePending || !snap;
+      writeButton.textContent = wbWritePending
+        ? '正在确认写入…'
+        : '写入当前字段到 Mufy';
+    }
+
+    if (undoButton) {
+      var canUndo = !!(
+        !wbWritePending &&
+        snap &&
+        wbLastWriteUndo &&
+        wbLastWriteUndo.fieldId === snap.fieldId &&
+        snap.syncStatus === 'synced' &&
+        snap.draftContent === snap.originalContent
+      );
+
+      undoButton.disabled = !canUndo;
+    }
+  }
+
+  function ensureV051WorkbenchControls() {
+    if (!wbEl) return;
+
+    injectV051Style();
+
+    var helperTitle = panelEl
+      ? panelEl.querySelector('#mufy-helper-header span')
+      : null;
+
+    if (helperTitle) {
+      helperTitle.textContent = '🧩 Mufy 字段助手 V0.5.1';
+    }
+
+    var row = wbEl.querySelector('#mufy-wb-write-row');
+    var status = wbEl.querySelector('#mufy-wb-write-status');
+    var undoButton = wbEl.querySelector('#mufy-wb-undo-write-btn');
+
+    if (row && !undoButton) {
+      undoButton = document.createElement('button');
+      undoButton.id = 'mufy-wb-undo-write-btn';
+      undoButton.className = 'secondary';
+      undoButton.type = 'button';
+      undoButton.disabled = true;
+      undoButton.textContent = '撤销本次写入';
+
+      row.insertBefore(undoButton, status || null);
+
+      undoButton.addEventListener('click', undoCurrentWbWriteV051);
+    }
+
+    var editor = wbEl.querySelector('#mufy-wb-editor');
+
+    if (editor && !editor.dataset.v051UndoBound) {
+      editor.dataset.v051UndoBound = '1';
+
+      editor.addEventListener('input', function () {
+        var snap = getCurrentWbSnapV051();
+
+        if (!snap) return;
+
+        clearWbUndoV051(snap.fieldId);
+
+        window.setTimeout(updateWbWriteControlsV051, 0);
+      });
+    }
+
+    ['#mufy-wb-restore', '#mufy-wb-discard'].forEach(function (selector) {
+      var button = wbEl.querySelector(selector);
+
+      if (!button || button.dataset.v051UndoBound) return;
+
+      button.dataset.v051UndoBound = '1';
+
+      button.addEventListener('click', function () {
+        var snap = getCurrentWbSnapV051();
+
+        if (snap) clearWbUndoV051(snap.fieldId);
+
+        window.setTimeout(updateWbWriteControlsV051, 0);
+      });
+    });
+
+    updateWbWriteControlsV051();
+  }
+
+  function writeFieldValueV051(field, value) {
+    if (field.type === 'contenteditable') {
+      setEditableValue(field.el, value);
+    } else {
+      setNativeValue(field.el, value);
+    }
+
+    try {
+      field.el.blur();
+      field.el.dispatchEvent(new Event('blur', { bubbles: true }));
+    } catch (error) {}
+  }
+
+  writeCurrentFieldToMufy = function () {
+    if (wbWritePending) return;
+
+    var snap = getCurrentWbSnapV051();
+
+    if (!snap) return;
+
+    var editor = wbEl.querySelector('#mufy-wb-editor');
+    snap.draftContent = editor.value;
+
+    var field = getWbFieldByIdV051(snap.fieldId);
+
+    if (!field || !field.el || !field.el.isConnected) {
+      snap.syncStatus = 'stale';
+      setWbWriteStatus('err', '字段已卸载，请重新扫描');
+      renderWbFieldList();
+      updateWbWriteControlsV051();
+      return;
+    }
+
+    var pageValueBeforeWrite = getValue(field.el);
+    var originalBeforeWrite = snap.originalContent;
+    var expectedValue = snap.draftContent;
+
+    wbWritePending = true;
+
+    setWbWriteStatus('warn', '正在填入 Mufy 编辑器…');
+    updateWbWriteControlsV051();
+
+    try {
+      writeFieldValueV051(field, expectedValue);
+    } catch (error) {
+      wbWritePending = false;
+      snap.syncStatus = 'failed';
+
+      setWbWriteStatus(
+        'err',
+        '写入失败：' + (error && error.message ? error.message : '未知错误')
+      );
+
+      renderWbFieldList();
+      updateWbWriteControlsV051();
+      return;
+    }
+
+    window.setTimeout(function () {
+      if (wbSnapshot.indexOf(snap) === -1) return;
+
+      wbWritePending = false;
+
+      if (!field.el || !field.el.isConnected) {
+        snap.syncStatus = 'stale';
+        setWbWriteStatus('err', '字段在校验时已卸载，请重新扫描');
+      } else if (getValue(field.el) === expectedValue) {
+        wbLastWriteUndo = {
+          fieldId: snap.fieldId,
+          pageValueBeforeWrite: pageValueBeforeWrite,
+          originalBeforeWrite: originalBeforeWrite
+        };
+
+        snap.originalContent = expectedValue;
+        snap.draftContent = expectedValue;
+        snap.syncStatus = 'synced';
+
+        setWbWriteStatus(
+          'ok',
+          '已填入 Mufy 编辑器 ✓ 请手动点击“更新角色”保存'
+        );
+      } else {
+        snap.syncStatus = 'failed';
+        setWbWriteStatus('err', '写入失败：延迟校验不一致');
+      }
+
+      renderWbFieldList();
+      updateWbWriteControlsV051();
+      scheduleWbRightPanelUpdate();
+    }, 160);
+  };
+
+  function undoCurrentWbWriteV051() {
+    if (wbWritePending) return;
+
+    var snap = getCurrentWbSnapV051();
+    var undo = wbLastWriteUndo;
+
+    if (
+      !snap ||
+      !undo ||
+      undo.fieldId !== snap.fieldId ||
+      snap.syncStatus !== 'synced' ||
+      snap.draftContent !== snap.originalContent
+    ) {
+      setWbWriteStatus('warn', '当前字段没有可安全撤销的写入');
+      updateWbWriteControlsV051();
+      return;
+    }
+
+    var field = getWbFieldByIdV051(snap.fieldId);
+
+    if (!field || !field.el || !field.el.isConnected) {
+      snap.syncStatus = 'stale';
+      setWbWriteStatus('err', '字段已卸载，无法安全撤销，请重新扫描');
+      renderWbFieldList();
+      updateWbWriteControlsV051();
+      return;
+    }
+
+    wbWritePending = true;
+
+    setWbWriteStatus('warn', '正在撤销写入…');
+    updateWbWriteControlsV051();
+
+    try {
+      writeFieldValueV051(field, undo.pageValueBeforeWrite);
+    } catch (error) {
+      wbWritePending = false;
+
+      setWbWriteStatus(
+        'err',
+        '撤销失败：' + (error && error.message ? error.message : '未知错误')
+      );
+
+      updateWbWriteControlsV051();
+      return;
+    }
+
+    window.setTimeout(function () {
+      if (wbSnapshot.indexOf(snap) === -1) return;
+
+      wbWritePending = false;
+
+      if (!field.el || !field.el.isConnected) {
+        snap.syncStatus = 'stale';
+        setWbWriteStatus('err', '字段在撤销校验时已卸载，请重新扫描');
+      } else if (getValue(field.el) === undo.pageValueBeforeWrite) {
+        snap.originalContent = undo.originalBeforeWrite;
+        snap.syncStatus = snap.draftContent === snap.originalContent
+          ? 'clean'
+          : 'dirty';
+
+        wbLastWriteUndo = null;
+
+        setWbWriteStatus(
+          'warn',
+          '已撤销填入；工作台草稿仍保留，待再次写入'
+        );
+      } else {
+        snap.syncStatus = 'failed';
+        setWbWriteStatus('err', '撤销失败：延迟校验不一致');
+      }
+
+      renderWbFieldList();
+      updateWbWriteControlsV051();
+      scheduleWbRightPanelUpdate();
+    }, 160);
+  }
+
+  openWorkbench = function () {
+    var result = v050OpenWorkbench.apply(this, arguments);
+
+    ensureV051WorkbenchControls();
+
+    return result;
+  };
+
+  closeWorkbench = function () {
+    var result = v050CloseWorkbench.apply(this, arguments);
+
+    if (wbEl && !wbEl.classList.contains('open')) {
+      wbLastWriteUndo = null;
+      wbWritePending = false;
+    }
+
+    return result;
+  };
+
+  selectWbField = function (index) {
+    var result = v050SelectWbField.call(this, index);
+
+    ensureV051WorkbenchControls();
+
+    var snap = getCurrentWbSnapV051();
+
+    if (snap && snap.syncStatus === 'synced') {
+      setWbWriteStatus(
+        'ok',
+        '已填入 Mufy 编辑器 ✓ 请手动点击“更新角色”保存'
+      );
+    }
+
+    updateWbWriteControlsV051();
+
+    return result;
+  };
+  
   function init() {
     injectStyleOnce();
     ensureUI();
