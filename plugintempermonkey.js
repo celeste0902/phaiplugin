@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.5.10
+// @version      0.5.17
 // @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含物品聚合工作台、三态草稿层与安全单字段注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
@@ -11,6 +11,56 @@
   'use strict';
 
   /*
+    V0.5.15 专注编辑模式 + Mufy 手动回填复制流
+    - 新增 wbFocusMode / wbClipboardTarget 全局状态。
+    - 工作台顶栏新增"⛶ 专注编辑"按钮：隐藏左右栏，中区占满宽度（mufy-wb-focus class）。
+    - Esc 键：专注模式内只退出专注，不关工作台，不丢草稿。
+    - 返回按钮改为"← 收起并返回 Mufy"，tooltip 强调草稿保留。
+    - 普通字段区底部新增 [复制当前字段] [复制并返回 Mufy]。
+    - 交互表单：交互名称 / 提示词每行加 [复制] 按钮；每条文案加 [复制]；底部加 [复制当前交互回填包] [复制当前焦点内容并返回 Mufy]。
+    - 物品上下文区新增 [复制本物品草稿包]（包含基础字段 + 所有交互 draftData）。
+    - 焦点追踪：每个可编辑控件 focus 时更新 wbClipboardTarget。
+    - 新增 copyRawDraftText / serializeInteractionDraft / serializeItemDraftBundle / copyCurrentWorkbenchTarget。
+    - 再次进入工作台时恢复 wbFocusMode 状态。
+    - 更新交互草稿边界提示文案。
+
+    V0.5.17 普通字段编辑界面减法
+    - interactionSnapshotsByItemKey 快照升级为三态模型：entryData / syncedData / draftData + syncStatus。
+    - 新增 wbCurrentInteraction：工作台当前选中的交互（{ itemKey, interactionKey }）。
+    - 工作台左栏物品卡展开后显示"基础信息"和"已采集交互"两段，交互条目可点击选中。
+    - 工作台中间区：选中交互时展示结构化表单（交互名称 / 提示词 / 使用后文案数组 / 使用后操作）。
+    - "写入当前字段"在交互模式下禁用并显示说明；"还原"还原 draftData → syncedData。
+    - "复制给 LLM"追加交互 draftData 导出块，parseMarkdownToMap 遇此块立即停止解析。
+    - 再次从 Mufy dialog 读取：clean → 同步更新 draftData；dirty/sourceChanged → 仅更新 syncedData。
+    - 采集后若工作台已打开，自动刷新左栏和当前表单状态。
+
+    V0.5.13 交互采集稳定性修复（持久会话模型）
+    - 用 interactionCaptureSession（持久会话对象）替换 interactionCaptureArm（一次性 arm）。
+    - 新增 scheduleStableInteractionRead()：弹窗出现后 180ms 初读，React 未灌入值时每 120ms 最多重试 8 次。
+    - 新增 handleNewInteractionDialog()：绑定保存按钮事件委托（capture 阶段）+ input/change + 子树 MO 实时同步。
+    - 新增 endInteractionCaptureSession()："结束采集"按钮 / HUD 一键结束；清理所有监听和计时器。
+    - 新增 clearItemInteractionSnapshots()：确认后清空单物品的全部交互快照。
+    - 新增 getOrCreateInteractionHud() + updateInteractionHud()：右下角固定 HUD 实时显示采集状态。
+    - renderInteractionSection() 改为会话感知：当前物品激活会话时显示"结束采集"；有快照时显示"清空交互"。
+    - scanFields() 过滤器新增 !el.closest('[role="dialog"]')，防止交互弹窗输入框污染 fields 数组。
+    - readInteractionFromDialog() 使用后文案容器判断改为 !parent.contains(nameEl) && !parent.contains(promptEl)。
+    - MutationObserver 守卫条件改为 !interactionCaptureSession。
+
+    V0.5.12 物品交互弹窗采集（只读快照 + 导出）
+    - 新增"采集交互"按钮于物品卡；点击后 arm interactionCaptureArm，收起面板。
+    - 新增 findOpenInteractionDialog()：识别 [role="dialog"][data-state="open"] + h2"交互编辑" + #interaction-name + #use-copywriting。
+    - 新增 readInteractionFromDialog()：读取交互名称、提示词、使用后文案（支持多条）、使用后操作 checkbox。
+    - 新增 MutationObserver（subtree）：只有 arm/activeDialog 非空时才实际执行，避免空转。
+    - 弹窗打开后立刻读取 observed 快照；用户点保存后更新为 saved 快照；关闭后保留 observed 原样。
+    - interactionSnapshotsByItemKey 独立存储，不混入 fields 数组，不参与工作台写入。
+    - buildMarkdown() 追加只读交互块；parseMarkdownToMap() 遇 H1 只读标记立即停止解析。
+    - 同 roleId 保留快照；跨 roleId 时 clearInteractionSnapshots()；scanFields 后 prune 孤立快照。
+
+    V0.5.11 全选安全修复
+    - 全选只操作 getSelectableFields()（排除 isUnrecognized/needsReview）。
+    - 强制保持未确认字段 enabled=false；有待确认字段时 toast 提示数量。
+    - renderNormalFieldRow checkbox change 无论 compact 与否均调用 renderList()。
+
     V0.5.10 工作台暂存返回
     - "退出工作台"改为"← 返回 Mufy 页面"，关闭时只隐藏工作台，不清空任何草稿。
     - openWorkbench() 检测同角色 wbSessionRoleId：相同则直接恢复会话（不重新扫描、不覆盖 draftContent）。
@@ -73,6 +123,20 @@
   var wbSessionRoleId = '';
   var itemListExpanded = {};
   var wbItemExpanded = {};
+  var wbCurrentInteraction = null;  // { itemKey, interactionKey } | null
+  var wbFocusMode = false;
+  var wbClipboardTarget = null;  // { kind, itemKey, interactionKey, copywritingIndex } | null
+  var wbCurrentInteractionEditorTarget = null;  // { kind: 'prompt' | 'afterCopywriting', copywritingIndex: number | null }
+
+  // 交互采集状态
+  var interactionSnapshotsByItemKey = {};      // { itemKey: { interactionKey: snapshot } }
+  var interactionCaptureSession = null;        // { itemKey, itemName, roleId, startedAt, capturedCount }
+  var activeInteractionDialog = null;          // 当前监听的弹窗 Element | null
+  var activeInteractionDialogObserver = null;  // 弹窗内部 MutationObserver
+  var interactionCaptureRoleId = '';           // 采集会话归属 roleId
+  var interactionObserverQueued = false;
+  var interactionDebounceTimer = null;         // 稳定读取防抖计时器
+  var interactionHudEl = null;                 // 固定采集状态 HUD
 
   /* ─── 工具函数 ─── */
 
@@ -288,6 +352,83 @@
     ].join(';');
     document.body.appendChild(node);
     setTimeout(function () { node.remove(); }, 2800);
+  }
+
+  /* ─── 草稿复制辅助 ─── */
+
+  function copyRawDraftText(text, successMessage) {
+    copyText(text).then(function (ok) {
+      toast(ok ? successMessage : '复制失败，请手动选择文本');
+    });
+  }
+
+  function serializeInteractionDraft(snap) {
+    var dd = snap.draftData;
+    var parts = [];
+    parts.push('【交互名称】\n' + (dd.interactionName || ''));
+    parts.push('【提示词】\n' + (dd.prompt || ''));
+    (dd.afterCopywriting || []).forEach(function (text, i) {
+      parts.push('【使用后文案 ' + (i + 1) + '】\n' + (text || ''));
+    });
+    parts.push('【使用后操作】\n' + (dd.afterAction ? '关闭' : '不操作'));
+    return parts.join('\n\n');
+  }
+
+  function serializeItemDraftBundle(itemGroup) {
+    var parts = [];
+    // 基础字段来自 wbSnapshot
+    wbSnapshot.forEach(function (snap) {
+      var field = findFieldById(snap.fieldId);
+      if (!field || field.group !== itemGroup) return;
+      var roleName = field.role || snap.label;
+      parts.push('【物品' + roleName + '】\n' + snap.draftContent);
+    });
+    // 交互 draftData
+    var ixnMap = interactionSnapshotsByItemKey[itemGroup] || {};
+    Object.keys(ixnMap).forEach(function (ik) {
+      var snap = ixnMap[ik];
+      var dd = snap.draftData;
+      parts.push('【交互｜' + (dd.interactionName || ik) + '】\n\n' + serializeInteractionDraft(snap));
+    });
+    return parts.join('\n\n');
+  }
+
+  function copyCurrentWorkbenchTarget() {
+    if (!wbCurrentInteraction) {
+      // 普通字段模式：直接复制当前 draftContent 并收起
+      var snap = getCurrentWbSnap();
+      if (!snap) { toast('请先选择一个字段'); return; }
+      copyRawDraftText(snap.draftContent, '已复制"' + snap.label + '"的草稿，可粘贴到 Mufy 对应输入框。');
+      closeWorkbench();
+      return;
+    }
+
+    // 交互模式：按焦点复制
+    if (!wbClipboardTarget || wbClipboardTarget.kind === 'field') {
+      toast('请先点击需要复制的交互字段，或使用该字段右侧"复制"按钮。');
+      return;
+    }
+
+    var ixnSnap = getCurrentIxnSnap();
+    if (!ixnSnap) return;
+    var dd = ixnSnap.draftData;
+    var text = '';
+    var label = '';
+
+    if (wbClipboardTarget.kind === 'interactionName') {
+      text = dd.interactionName || '';
+      label = '交互名称';
+    } else if (wbClipboardTarget.kind === 'interactionPrompt') {
+      text = dd.prompt || '';
+      label = '提示词';
+    } else if (wbClipboardTarget.kind === 'afterCopywriting') {
+      var idx = wbClipboardTarget.copywritingIndex;
+      text = (dd.afterCopywriting || [])[idx] || '';
+      label = '使用后文案 ' + (idx + 1);
+    }
+
+    copyRawDraftText(text, '已复制"' + label + '"，可粘贴到 Mufy 交互编辑窗对应输入框。');
+    closeWorkbench();
   }
 
   function copyText(text) {
@@ -518,6 +659,459 @@
     return wbSnapshot.length > 0 && wbSessionRoleId === getCurrentRoleId();
   }
 
+  /* ─── 交互弹窗采集 ─── */
+
+  /* ── 弹窗识别 ── */
+
+  function findOpenInteractionDialog() {
+    var dialogs = Array.from(document.querySelectorAll('[role="dialog"][data-state="open"]'));
+    for (var i = 0; i < dialogs.length; i++) {
+      var d = dialogs[i];
+      var h2 = d.querySelector('h2');
+      if (!h2 || h2.textContent.trim() !== '交互编辑') continue;
+      if (!d.querySelector('#interaction-name')) continue;
+      if (!d.querySelector('#use-copywriting')) continue;
+      return d;
+    }
+    return null;
+  }
+
+  /* ── 弹窗字段读取 ── */
+
+  function readInteractionFromDialog(dialog) {
+    var nameEl = dialog.querySelector('#interaction-name');
+    var promptEl = dialog.querySelector('#use-copywriting');
+    var interactionName = nameEl ? nameEl.value.trim() : '';
+    var prompt = promptEl ? promptEl.value : '';
+
+    // 使用后文案：找到"使用后文案"标签，向上找最小容器：
+    //   - 含至少一个文本 input；
+    //   - 不含 #interaction-name 和 #use-copywriting。
+    var afterCopywriting = [];
+    var allNodes = Array.from(dialog.querySelectorAll('*'));
+    var copywritingSection = null;
+
+    for (var i = 0; i < allNodes.length; i++) {
+      var node = allNodes[i];
+      if (!node.children.length && node.textContent.trim() === '使用后文案') {
+        var parent = node.parentElement;
+        for (var depth = 0; depth < 8 && parent; depth++) {
+          var textInputs = parent.querySelectorAll('input[type="text"], input:not([type])');
+          if (textInputs.length > 0 && !parent.contains(nameEl) && !parent.contains(promptEl)) {
+            copywritingSection = parent;
+            break;
+          }
+          parent = parent.parentElement;
+        }
+        break;
+      }
+    }
+
+    if (copywritingSection) {
+      Array.from(copywritingSection.querySelectorAll('input[type="text"], input:not([type])')).forEach(function (inp) {
+        afterCopywriting.push(inp.value);
+      });
+    }
+
+    // 使用后操作
+    var afterAction = false;
+    for (var j = 0; j < allNodes.length; j++) {
+      var el = allNodes[j];
+      if (!el.children.length && el.textContent.trim() === '使用后操作') {
+        var container = el.parentElement;
+        for (var d2 = 0; d2 < 8 && container; d2++) {
+          var cb = container.querySelector('input[type="checkbox"]');
+          if (cb) { afterAction = cb.checked; break; }
+          container = container.parentElement;
+        }
+        break;
+      }
+    }
+
+    return { interactionName: interactionName, prompt: prompt, afterCopywriting: afterCopywriting, afterAction: afterAction };
+  }
+
+  /* ── 快照存储 ── */
+
+  function cloneIxnData(data) {
+    return {
+      interactionName: data.interactionName,
+      prompt: data.prompt,
+      afterCopywriting: (data.afterCopywriting || []).slice(),
+      afterAction: !!data.afterAction
+    };
+  }
+
+  function storeInteractionSnapshot(itemKey, itemName, data, state) {
+    var key = data.interactionName;
+    if (!key) return null;
+    if (!interactionSnapshotsByItemKey[itemKey]) interactionSnapshotsByItemKey[itemKey] = {};
+    var existing = interactionSnapshotsByItemKey[itemKey][key];
+    var captureState = state || (existing ? existing.captureState : 'observed');
+
+    if (!existing) {
+      var entry = cloneIxnData(data);
+      interactionSnapshotsByItemKey[itemKey][key] = {
+        itemKey: itemKey,
+        itemName: itemName,
+        interactionKey: key,
+        entryData: entry,
+        syncedData: cloneIxnData(data),
+        draftData: cloneIxnData(data),
+        captureState: captureState,
+        syncStatus: 'clean',
+        capturedAt: Date.now()
+      };
+    } else {
+      existing.syncedData = cloneIxnData(data);
+      existing.captureState = captureState;
+      existing.capturedAt = Date.now();
+      if (existing.syncStatus === 'clean') {
+        existing.draftData = cloneIxnData(data);
+      } else {
+        existing.syncStatus = 'sourceChanged';
+      }
+    }
+    return interactionSnapshotsByItemKey[itemKey][key];
+  }
+
+  /* ── 稳定读取（等待 React 灌入 value） ── */
+
+  function attemptInteractionRead(dialog, attempt) {
+    if (!dialog.isConnected || dialog.getAttribute('data-state') !== 'open') return;
+    if (!interactionCaptureSession) return;
+
+    var nameEl = dialog.querySelector('#interaction-name');
+    var name = nameEl ? nameEl.value.trim() : '';
+
+    if (!name) {
+      if (attempt < 8) {
+        interactionDebounceTimer = window.setTimeout(function () {
+          interactionDebounceTimer = null;
+          attemptInteractionRead(dialog, attempt + 1);
+        }, 120);
+      } else {
+        updateInteractionHud('交互内容尚未加载完成，请稍候或重新打开该交互。');
+      }
+      return;
+    }
+
+    var session = interactionCaptureSession;
+    var data = readInteractionFromDialog(dialog);
+    var snap = storeInteractionSnapshot(session.itemKey, session.itemName, data, 'observed');
+    if (snap) {
+      session.capturedCount = Object.keys(interactionSnapshotsByItemKey[session.itemKey] || {}).length;
+      updateInteractionHud();
+      renderList();
+      if (wbEl && wbEl.classList.contains('open')) {
+        renderWbFieldList();
+        if (wbCurrentInteraction &&
+            wbCurrentInteraction.itemKey === snap.itemKey &&
+            wbCurrentInteraction.interactionKey === snap.interactionKey) {
+          var statusEl = wbEl.querySelector('#mufy-ixn-sync-status');
+          if (statusEl) statusEl.textContent = ixnSyncStatusText(snap.syncStatus);
+        }
+      }
+    }
+  }
+
+  function scheduleStableInteractionRead(dialog, reason) {
+    if (interactionDebounceTimer) {
+      window.clearTimeout(interactionDebounceTimer);
+      interactionDebounceTimer = null;
+    }
+    var delay = reason === 'new-dialog' ? 180 : 180;
+    interactionDebounceTimer = window.setTimeout(function () {
+      interactionDebounceTimer = null;
+      attemptInteractionRead(dialog, 0);
+    }, delay);
+  }
+
+  /* ── 新弹窗接管（事件委托 + 实时更新） ── */
+
+  function handleNewInteractionDialog(dialog) {
+    activeInteractionDialog = dialog;
+
+    // 初始稳定读取
+    scheduleStableInteractionRead(dialog, 'new-dialog');
+
+    // 保存按钮：事件委托（capture 阶段，React 替换节点也能捕获）
+    dialog.addEventListener('click', function (event) {
+      var btn = event.target && event.target.closest ? event.target.closest('button') : null;
+      if (!btn || btn.textContent.trim() !== '保存') return;
+      if (!interactionCaptureSession) return;
+      window.setTimeout(function () {
+        if (!dialog.isConnected) return;
+        var data = readInteractionFromDialog(dialog);
+        if (!data.interactionName) return;
+        var session = interactionCaptureSession;
+        var saved = storeInteractionSnapshot(session.itemKey, session.itemName, data, 'saved');
+        session.capturedCount = Object.keys(interactionSnapshotsByItemKey[session.itemKey] || {}).length;
+        updateInteractionHud();
+        renderList();
+        if (saved && wbEl && wbEl.classList.contains('open')) {
+          renderWbFieldList();
+          if (wbCurrentInteraction &&
+              wbCurrentInteraction.itemKey === saved.itemKey &&
+              wbCurrentInteraction.interactionKey === saved.interactionKey) {
+            var statusEl = wbEl.querySelector('#mufy-ixn-sync-status');
+            if (statusEl) statusEl.textContent = ixnSyncStatusText(saved.syncStatus);
+          }
+        }
+        toast('已保存"' + data.interactionName + '"交互快照');
+      }, 30);
+    }, true);
+
+    // 实时更新（input / change / 增加文案后 childList 变化）
+    function scheduleLiveUpdate() {
+      scheduleStableInteractionRead(dialog, 'live-update');
+    }
+    dialog.addEventListener('input', scheduleLiveUpdate);
+    dialog.addEventListener('change', scheduleLiveUpdate);
+
+    var dialogMutObs = new MutationObserver(scheduleLiveUpdate);
+    dialogMutObs.observe(dialog, { childList: true, subtree: true });
+    activeInteractionDialogObserver = dialogMutObs;
+  }
+
+  /* ── dialog 状态轮询 ── */
+
+  function checkForInteractionDialog() {
+    if (activeInteractionDialog) {
+      var stillOpen = activeInteractionDialog.isConnected &&
+        activeInteractionDialog.getAttribute('data-state') === 'open';
+      if (!stillOpen) {
+        if (activeInteractionDialogObserver) {
+          activeInteractionDialogObserver.disconnect();
+          activeInteractionDialogObserver = null;
+        }
+        if (interactionDebounceTimer) {
+          window.clearTimeout(interactionDebounceTimer);
+          interactionDebounceTimer = null;
+        }
+        activeInteractionDialog = null;
+        if (interactionCaptureSession) updateInteractionHud();
+      }
+      return;
+    }
+    if (!interactionCaptureSession) return;
+    var dialog = findOpenInteractionDialog();
+    if (dialog) handleNewInteractionDialog(dialog);
+  }
+
+  /* ── 采集会话管理 ── */
+
+  function startInteractionCaptureSession(entity) {
+    var currentRoleId = getCurrentRoleId();
+    if (interactionCaptureRoleId && interactionCaptureRoleId !== currentRoleId) {
+      interactionSnapshotsByItemKey = {};
+    }
+    interactionCaptureRoleId = currentRoleId;
+
+    if (interactionCaptureSession) endInteractionCaptureSession();
+
+    var existingCount = Object.keys(interactionSnapshotsByItemKey[entity.itemKey] || {}).length;
+    interactionCaptureSession = {
+      itemKey: entity.itemKey,
+      itemName: entity.itemName,
+      roleId: currentRoleId,
+      startedAt: Date.now(),
+      capturedCount: existingCount
+    };
+    activeInteractionDialog = null;
+    if (panelEl) panelEl.classList.remove('open');
+    updateInteractionHud();
+    renderList();
+    toast('已开始采集"' + entity.itemName + '"的交互，请点击 Mufy 中的交互按钮打开"交互编辑"窗口。');
+  }
+
+  function endInteractionCaptureSession() {
+    if (activeInteractionDialogObserver) {
+      activeInteractionDialogObserver.disconnect();
+      activeInteractionDialogObserver = null;
+    }
+    if (interactionDebounceTimer) {
+      window.clearTimeout(interactionDebounceTimer);
+      interactionDebounceTimer = null;
+    }
+    interactionCaptureSession = null;
+    activeInteractionDialog = null;
+    if (interactionHudEl) interactionHudEl.style.display = 'none';
+    renderList();
+    toast('已结束交互采集');
+  }
+
+  function clearItemInteractionSnapshots(entity) {
+    var confirmed = window.confirm('确定清空"' + entity.itemName + '"已采集的全部交互快照吗？');
+    if (!confirmed) return;
+    delete interactionSnapshotsByItemKey[entity.itemKey];
+    if (interactionCaptureSession && interactionCaptureSession.itemKey === entity.itemKey) {
+      interactionCaptureSession.capturedCount = 0;
+    }
+    if (wbCurrentInteraction && wbCurrentInteraction.itemKey === entity.itemKey) {
+      wbCurrentInteraction = null;
+      if (wbEl && wbEl.classList.contains('open')) {
+        showNormalEditor();
+        updateWbWriteControls();
+      }
+    }
+    updateInteractionHud();
+    renderList();
+    if (wbEl && wbEl.classList.contains('open')) renderWbFieldList();
+  }
+
+  /* ── HUD ── */
+
+  function getOrCreateInteractionHud() {
+    if (interactionHudEl && interactionHudEl.isConnected) return interactionHudEl;
+    interactionHudEl = document.createElement('div');
+    interactionHudEl.id = 'mufy-interaction-hud';
+    interactionHudEl.innerHTML =
+      '<div class="mufy-hud-title">正在采集：<span id="mufy-hud-item-name"></span></div>' +
+      '<div class="mufy-hud-status"><span id="mufy-hud-status-text"></span></div>' +
+      '<button id="mufy-hud-end-btn" type="button">结束采集</button>';
+    interactionHudEl.querySelector('#mufy-hud-end-btn').addEventListener('click', endInteractionCaptureSession);
+    document.body.appendChild(interactionHudEl);
+    return interactionHudEl;
+  }
+
+  function updateInteractionHud(warningText) {
+    if (!interactionCaptureSession) {
+      if (interactionHudEl) interactionHudEl.style.display = 'none';
+      return;
+    }
+    var hud = getOrCreateInteractionHud();
+    hud.style.display = 'block';
+    hud.querySelector('#mufy-hud-item-name').textContent = interactionCaptureSession.itemName;
+    hud.querySelector('#mufy-hud-status-text').textContent = warningText ||
+      ('已读取：' + (interactionCaptureSession.capturedCount || 0) + ' 项');
+  }
+
+  /* ── 快照维护 ── */
+
+  function pruneInteractionSnapshots() {
+    var validKeys = {};
+    fields.forEach(function (f) { if (f.group) validKeys[f.group] = true; });
+    Object.keys(interactionSnapshotsByItemKey).forEach(function (k) {
+      if (!validKeys[k]) delete interactionSnapshotsByItemKey[k];
+    });
+  }
+
+  function clearInteractionSnapshots() {
+    interactionSnapshotsByItemKey = {};
+    wbCurrentInteraction = null;
+    interactionCaptureSession = null;
+    activeInteractionDialog = null;
+    if (activeInteractionDialogObserver) {
+      activeInteractionDialogObserver.disconnect();
+      activeInteractionDialogObserver = null;
+    }
+    if (interactionDebounceTimer) {
+      window.clearTimeout(interactionDebounceTimer);
+      interactionDebounceTimer = null;
+    }
+    interactionCaptureRoleId = '';
+    if (interactionHudEl) interactionHudEl.style.display = 'none';
+  }
+
+  function buildInteractionMarkdown() {
+    var itemKeys = Object.keys(interactionSnapshotsByItemKey);
+    if (!itemKeys.length) return '';
+
+    var lines = [
+      '',
+      '---',
+      '',
+      '# 已采集物品交互（只读上下文｜当前版本不支持自动回填交互弹窗）',
+      ''
+    ];
+
+    itemKeys.forEach(function (itemKey) {
+      var interactions = interactionSnapshotsByItemKey[itemKey];
+      var keys = Object.keys(interactions);
+      if (!keys.length) return;
+      lines.push('## ' + itemKey);
+      lines.push('');
+      keys.forEach(function (ik) {
+        var snap = interactions[ik];
+        var sd = snap.syncedData;
+        lines.push('### 交互｜' + (sd.interactionName || ik));
+        lines.push('');
+        lines.push('#### 提示词');
+        lines.push('');
+        lines.push(sd.prompt || '（空）');
+        lines.push('');
+        if (sd.afterCopywriting && sd.afterCopywriting.length) {
+          sd.afterCopywriting.forEach(function (text, idx) {
+            lines.push('#### 使用后文案 ' + (idx + 1));
+            lines.push('');
+            lines.push(text || '（空）');
+            lines.push('');
+          });
+        }
+        lines.push('#### 使用后操作');
+        lines.push('');
+        lines.push(sd.afterAction ? '关闭' : '不操作');
+        lines.push('');
+      });
+    });
+
+    return lines.join('\n');
+  }
+
+  function buildInteractionDraftMarkdown() {
+    var itemKeys = Object.keys(interactionSnapshotsByItemKey);
+    var hasAny = itemKeys.some(function (ik) {
+      return Object.keys(interactionSnapshotsByItemKey[ik]).length > 0;
+    });
+    if (!hasAny) return '';
+
+    var lines = [
+      '',
+      '---',
+      '',
+      '# 物品交互草稿（本地草稿｜当前版本不自动回填 Mufy）',
+      ''
+    ];
+
+    itemKeys.forEach(function (itemKey) {
+      var interactions = interactionSnapshotsByItemKey[itemKey];
+      var keys = Object.keys(interactions);
+      if (!keys.length) return;
+      var firstName = interactions[keys[0]].itemName;
+      lines.push('## 物品｜' + firstName);
+      lines.push('');
+      keys.forEach(function (ik) {
+        var snap = interactions[ik];
+        var dd = snap.draftData;
+        lines.push('### 交互｜' + (dd.interactionName || ik));
+        lines.push('');
+        lines.push('#### 交互名称');
+        lines.push('');
+        lines.push(dd.interactionName || ik);
+        lines.push('');
+        lines.push('#### 提示词');
+        lines.push('');
+        lines.push(dd.prompt || '（空）');
+        lines.push('');
+        if (dd.afterCopywriting && dd.afterCopywriting.length) {
+          dd.afterCopywriting.forEach(function (text, idx) {
+            lines.push('#### 使用后文案 ' + (idx + 1));
+            lines.push('');
+            lines.push(text || '（空）');
+            lines.push('');
+          });
+        }
+        lines.push('#### 使用后操作');
+        lines.push('');
+        lines.push(dd.afterAction ? '关闭' : '不操作');
+        lines.push('');
+      });
+    });
+
+    return lines.join('\n');
+  }
+
   function clearWorkbenchSession() {
     clearWbTokenTimer();
     wbLastWriteUndo = null;
@@ -526,6 +1120,7 @@
     wbSnapshot = [];
     wbSessionRoleId = '';
     wbItemExpanded = {};
+    clearInteractionSnapshots();
   }
 
   function buildWorkbenchItemEntities() {
@@ -559,7 +1154,8 @@
       return isVisible(el) &&
         !el.closest('#mufy-helper-panel') &&
         !el.closest('#mufy-helper-toggle') &&
-        !el.closest('#mufy-workbench');
+        !el.closest('#mufy-workbench') &&
+        !el.closest('[role="dialog"]');
     });
     fields = nodes.map(function (el, index) {
       var rawLabel = guessLabel(el);
@@ -584,6 +1180,7 @@
     pairItemFields(fields);
     assignUniqueItemGroups(fields);
     disambiguateLabels(fields);
+    pruneInteractionSnapshots();
     return fields;
   }
 
@@ -594,6 +1191,12 @@
   function getUnsafeEnabledFields() {
     return fields.filter(function (f) {
       return f.enabled && (f.isUnrecognized || f.needsReview);
+    });
+  }
+
+  function getSelectableFields() {
+    return fields.filter(function (f) {
+      return !f.isUnrecognized && !f.needsReview;
     });
   }
 
@@ -677,7 +1280,7 @@
     var body = selected.map(function (field) {
       return '## ' + field.label + '\n\n' + getValue(field.el) + '\n';
     }).join('\n');
-    return header + '\n' + body;
+    return header + '\n' + body + buildInteractionMarkdown();
   }
 
   function sectionBufferToContent(buffer) {
@@ -697,7 +1300,10 @@
       if (currentLabel !== null) map[currentLabel] = sectionBufferToContent(buffer);
       buffer = [];
     }
+    var hitReadonly = false;
     lines.forEach(function (line) {
+      if (hitReadonly) return;
+      if (line.indexOf('# 已采集物品交互') === 0 || line.indexOf('# 物品交互草稿') === 0) { flush(); hitReadonly = true; return; }
       var match = line.match(/^##\s+(.+?)\s*$/);
       var possibleLabel = match ? match[1].trim() : '';
       if (possibleLabel && labelSet.has(possibleLabel)) {
@@ -777,9 +1383,10 @@
 
     wbEl.innerHTML = [
       '<div id="mufy-wb-topbar">',
-      '  <button id="mufy-wb-return" title="暂时收起工作台；本页未刷新前可继续编辑当前草稿。">← 返回 Mufy 页面</button>',
+      '  <button id="mufy-wb-return" title="暂时隐藏工作台并回到当前 Mufy 编辑页；本页未刷新前草稿会保留。">← 收起工作台</button>',
       '  <button id="mufy-wb-copy-llm" class="secondary">复制给 LLM</button>',
-      '  <button id="mufy-wb-restore" class="secondary" title="放弃当前字段尚未写入 Mufy 的编辑，恢复到最近一次成功同步的版本。">还原当前字段草稿</button>',
+      '  <button id="mufy-wb-restore" class="secondary" title="放弃当前字段或交互草稿的编辑，恢复到最近一次同步版本。">还原当前字段草稿</button>',
+      '  <button id="mufy-wb-focus" class="secondary" title="隐藏左右栏，专注编辑当前内容。">⛶ 专注编辑</button>',
       '  <span id="mufy-wb-title" class="wb-title">工作台</span>',
       '</div>',
       '<div id="mufy-wb-body">',
@@ -787,13 +1394,40 @@
       '    <div id="mufy-wb-field-list"></div>',
       '  </div>',
       '  <div id="mufy-wb-center">',
-      '    <div id="mufy-wb-center-label"></div>',
       '    <div id="mufy-item-context"></div>',
       '    <textarea id="mufy-wb-editor" placeholder="从左侧选择一个字段…"></textarea>',
-      '    <div id="mufy-wb-write-row">',
+      '    <div id="mufy-wb-action-bar">',
       '      <button id="mufy-wb-write-btn">写入当前字段到 Mufy</button>',
-      '      <button id="mufy-wb-undo-write-btn" class="secondary" disabled>撤回编辑页写入</button>',
+      '      <button id="mufy-wb-undo-write-btn" class="secondary" style="display:none">撤回编辑页写入</button>',
       '      <span id="mufy-wb-write-status"></span>',
+      '      <button id="mufy-wb-copy-field" class="secondary">复制当前内容</button>',
+      '    </div>',
+      '    <div id="mufy-wb-interaction-form">',
+      '      <div class="mufy-ixn-name-row">',
+      '        <label class="mufy-ixn-label">交互名称</label>',
+      '        <input id="mufy-ixn-name" type="text" class="mufy-ixn-input" placeholder="交互名称">',
+      '        <button type="button" id="mufy-ixn-copy-name" class="mufy-ixn-copy-btn">复制名称</button>',
+      '      </div>',
+      '      <div id="mufy-ixn-tab-bar"></div>',
+      '      <textarea id="mufy-ixn-main-editor" class="mufy-ixn-main-textarea" placeholder="选择上方 tab 开始编辑…"></textarea>',
+      '      <div class="mufy-ixn-field-group mufy-ixn-action-row">',
+      '        <label class="mufy-ixn-label">使用后操作</label>',
+      '        <label class="mufy-ixn-checkbox-label">',
+      '          <input type="checkbox" id="mufy-ixn-after-action">',
+      '          <span>关闭</span>',
+      '        </label>',
+      '      </div>',
+      '      <div class="mufy-ixn-status-row">',
+      '        <span id="mufy-ixn-sync-status" class="mufy-ixn-sync-text"></span>',
+      '      </div>',
+      '      <div class="mufy-ixn-write-note">',
+      '        交互草稿已暂存在本地工作台。<br>请复制对应字段后，手动打开 Mufy 的交互编辑窗粘贴并保存。',
+      '      </div>',
+      '      <div class="mufy-ixn-footer">',
+      '        <button type="button" id="mufy-ixn-copy-current" class="secondary">复制当前内容</button>',
+      '        <button type="button" id="mufy-ixn-copy-collapse">复制并收起工作台</button>',
+      '        <button type="button" id="mufy-ixn-copy-bundle" class="secondary">复制当前交互回填包</button>',
+      '      </div>',
       '    </div>',
       '  </div>',
       '  <div id="mufy-wb-right">',
@@ -832,16 +1466,23 @@
 
     document.body.appendChild(wbEl);
 
-    /* 暂存返回 Mufy 页面（只隐藏工作台，不清空草稿） */
+    /* 收起工作台（只隐藏，不清空草稿，不跳转路由） */
     wbEl.querySelector('#mufy-wb-return').addEventListener('click', function () {
       closeWorkbench();
     });
 
-    /* 复制给 LLM：导出当前草稿（draftContent），保留本次工作台的最新编辑。 */
+    /* 复制给 LLM：导出当前草稿（draftContent）+ 交互 draftData。 */
     wbEl.querySelector('#mufy-wb-copy-llm').addEventListener('click', function () {
       if (!wbSnapshot.length) {
         toast('工作台里没有字段');
         return;
+      }
+      // 先把当前交互表单最新值刷入 draftData（如在交互模式）
+      if (wbCurrentInteraction) flushInteractionFormToDraft();
+      // 先把当前字段编辑器最新值刷入草稿
+      var editor = wbEl.querySelector('#mufy-wb-editor');
+      if (!wbCurrentInteraction && wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
+        wbSnapshot[wbCurrentIndex].draftContent = editor.value;
       }
       var header = [
         '以下仅包含本次已选中的角色卡字段。',
@@ -852,13 +1493,23 @@
       var body = wbSnapshot.map(function (snap) {
         return '## ' + snap.label + '\n\n' + snap.draftContent + '\n';
       }).join('\n');
-      copyText(header + '\n' + body).then(function (ok) {
-        toast(ok ? '已复制工作台字段（当前草稿），可粘贴给 LLM' : '复制失败，请手动选择文本');
+      copyText(header + '\n' + body + buildInteractionDraftMarkdown()).then(function (ok) {
+        toast(ok ? '已复制工作台字段（含交互草稿），可粘贴给 LLM' : '复制失败，请手动选择文本');
       });
     });
 
-    /* 还原草稿至当前同步版本：draft → syncedContent，不修改 Mufy 页面 */
+    /* 还原草稿至当前同步版本：draft → syncedContent 或 syncedData，不修改 Mufy 页面 */
     wbEl.querySelector('#mufy-wb-restore').addEventListener('click', function () {
+      if (wbCurrentInteraction) {
+        var ixnSnap = getCurrentIxnSnap();
+        if (!ixnSnap) return;
+        ixnSnap.draftData = cloneIxnData(ixnSnap.syncedData);
+        ixnSnap.syncStatus = 'clean';
+        showInteractionEditor();
+        renderWbFieldList();
+        toast('已将"' + (ixnSnap.syncedData.interactionName || ixnSnap.interactionKey) + '"还原至最近一次 Mufy 读取版本');
+        return;
+      }
       if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return;
       var snap = wbSnapshot[wbCurrentIndex];
       snap.draftContent = snap.syncedContent;
@@ -904,6 +1555,147 @@
       scheduleWbRightPanelUpdate();
       updateWbWriteControls();
     });
+
+    /* 交互表单事件 */
+    wbEl.querySelector('#mufy-ixn-name').addEventListener('input', function () {
+      var snap = getCurrentIxnSnap();
+      if (!snap) return;
+      snap.draftData.interactionName = this.value;
+      markIxnDirty(snap);
+    });
+
+    wbEl.querySelector('#mufy-ixn-after-action').addEventListener('change', function () {
+      var snap = getCurrentIxnSnap();
+      if (!snap) return;
+      snap.draftData.afterAction = this.checked;
+      markIxnDirty(snap);
+    });
+
+    /* 大编辑器实时保存到 draftData */
+    wbEl.querySelector('#mufy-ixn-main-editor').addEventListener('input', function () {
+      var snap = getCurrentIxnSnap();
+      if (!snap || !wbCurrentInteractionEditorTarget) return;
+      var t = wbCurrentInteractionEditorTarget;
+      if (t.kind === 'prompt') {
+        snap.draftData.prompt = this.value;
+      } else if (t.kind === 'afterCopywriting' && t.copywritingIndex != null) {
+        snap.draftData.afterCopywriting[t.copywritingIndex] = this.value;
+      }
+      markIxnDirty(snap);
+    });
+
+    /* Tab 栏（事件代理）：切换 / 删除 / 新增文案 */
+    wbEl.querySelector('#mufy-ixn-tab-bar').addEventListener('click', function (e) {
+      var snap = getCurrentIxnSnap();
+      if (!snap) return;
+
+      /* 删除文案 */
+      var delSpan = e.target.closest('.mufy-ixn-tab-del');
+      if (delSpan) {
+        var delIdx = parseInt(delSpan.dataset.delIndex, 10);
+        snap.draftData.afterCopywriting.splice(delIdx, 1);
+        markIxnDirty(snap);
+        /* 决定切换到哪个 tab */
+        var cur = wbCurrentInteractionEditorTarget;
+        if (cur && cur.kind === 'afterCopywriting' && cur.copywritingIndex >= delIdx) {
+          var next = cur.copywritingIndex - 1;
+          if (snap.draftData.afterCopywriting.length === 0 || next < 0) {
+            wbCurrentInteractionEditorTarget = { kind: 'prompt', copywritingIndex: null };
+          } else {
+            wbCurrentInteractionEditorTarget = { kind: 'afterCopywriting', copywritingIndex: Math.min(next, snap.draftData.afterCopywriting.length - 1) };
+          }
+        }
+        renderIxnTabBar(snap);
+        loadIxnMainEditor(snap);
+        return;
+      }
+
+      /* 新增文案 */
+      if (e.target.closest('.mufy-ixn-tab-add')) {
+        flushIxnEditorToDraft(snap);
+        snap.draftData.afterCopywriting.push('');
+        markIxnDirty(snap);
+        var newIdx = snap.draftData.afterCopywriting.length - 1;
+        wbCurrentInteractionEditorTarget = { kind: 'afterCopywriting', copywritingIndex: newIdx };
+        renderIxnTabBar(snap);
+        loadIxnMainEditor(snap);
+        wbEl.querySelector('#mufy-ixn-main-editor').focus();
+        return;
+      }
+
+      /* 切换 tab */
+      var tab = e.target.closest('.mufy-ixn-tab');
+      if (tab) {
+        flushIxnEditorToDraft(snap);
+        var kind = tab.dataset.kind;
+        var idx = kind === 'afterCopywriting' ? parseInt(tab.dataset.index, 10) : null;
+        wbCurrentInteractionEditorTarget = { kind: kind, copywritingIndex: idx };
+        renderIxnTabBar(snap);
+        loadIxnMainEditor(snap);
+        wbEl.querySelector('#mufy-ixn-main-editor').focus();
+      }
+    });
+
+    /* 交互名称复制 */
+    wbEl.querySelector('#mufy-ixn-copy-name').addEventListener('click', function () {
+      var snap = getCurrentIxnSnap();
+      if (!snap) return;
+      copyRawDraftText(snap.draftData.interactionName || '', '已复制交互名称。');
+    });
+
+    /* 复制当前内容（按当前 tab） */
+    wbEl.querySelector('#mufy-ixn-copy-current').addEventListener('click', function () {
+      var snap = getCurrentIxnSnap();
+      if (!snap) return;
+      var text = getCurrentIxnEditorText(snap);
+      var label = getCurrentIxnEditorLabel();
+      copyRawDraftText(text, '已复制' + label + '，可粘贴到 Mufy 交互编辑窗对应输入框。');
+    });
+
+    /* 复制并收起工作台 */
+    wbEl.querySelector('#mufy-ixn-copy-collapse').addEventListener('click', function () {
+      var snap = getCurrentIxnSnap();
+      if (!snap) return;
+      var text = getCurrentIxnEditorText(snap);
+      var label = getCurrentIxnEditorLabel();
+      copyText(text).then(function (ok) {
+        toast(ok ? '已复制' + label + '，工作台已收起。' : '复制失败，请手动选择文本');
+        if (ok) closeWorkbench();
+      });
+    });
+
+    /* 复制当前交互回填包 */
+    wbEl.querySelector('#mufy-ixn-copy-bundle').addEventListener('click', function () {
+      var snap = getCurrentIxnSnap();
+      if (!snap) return;
+      copyRawDraftText(serializeInteractionDraft(snap), '已复制"' + (snap.draftData.interactionName || snap.interactionKey) + '"回填包。');
+    });
+
+    /* 普通字段复制 */
+    wbEl.querySelector('#mufy-wb-copy-field').addEventListener('click', function () {
+      var snap = getCurrentWbSnap();
+      if (!snap) { toast('请先选择一个字段'); return; }
+      copyRawDraftText(snap.draftContent, '已复制"' + snap.label + '"的草稿。');
+    });
+
+
+    /* 专注编辑 */
+    wbEl.querySelector('#mufy-wb-focus').addEventListener('click', function () {
+      wbFocusMode = !wbFocusMode;
+      wbEl.classList.toggle('mufy-wb-focus', wbFocusMode);
+      this.textContent = wbFocusMode ? '↙ 退出专注编辑' : '⛶ 专注编辑';
+    });
+
+    /* Esc：只退出专注模式，不关工作台 */
+    wbEl.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape' && wbFocusMode) {
+        event.stopPropagation();
+        wbFocusMode = false;
+        wbEl.classList.remove('mufy-wb-focus');
+        var btn = wbEl.querySelector('#mufy-wb-focus');
+        if (btn) btn.textContent = '⛶ 专注编辑';
+      }
+    });
   }
 
   function openWorkbench() {
@@ -912,9 +1704,17 @@
     if (wbSnapshot.length > 0) {
       if (hasActiveWorkbenchSession()) {
         wbEl.classList.add('open');
+        wbEl.classList.toggle('mufy-wb-focus', wbFocusMode);
+        var focusBtn = wbEl.querySelector('#mufy-wb-focus');
+        if (focusBtn) focusBtn.textContent = wbFocusMode ? '↙ 退出专注编辑' : '⛶ 专注编辑';
         renderWbFieldList();
-        selectWbField(wbCurrentIndex >= 0 ? wbCurrentIndex : 0);
-        updateWbWriteControls();
+        if (wbCurrentInteraction) {
+          showInteractionEditor();
+          updateWbWriteControls();
+        } else {
+          selectWbField(wbCurrentIndex >= 0 ? wbCurrentIndex : 0);
+          updateWbWriteControls();
+        }
         toast('已恢复本次工作台草稿');
         return;
       }
@@ -957,8 +1757,10 @@
   }
 
   function hasDirtyWbDrafts() {
-    return wbSnapshot.some(function (snap) {
-      return snap.draftContent !== snap.syncedContent;
+    if (wbSnapshot.some(function (snap) { return snap.draftContent !== snap.syncedContent; })) return true;
+    return Object.keys(interactionSnapshotsByItemKey).some(function (ik) {
+      var byItem = interactionSnapshotsByItemKey[ik];
+      return Object.keys(byItem).some(function (k) { return byItem[k].syncStatus === 'dirty'; });
     });
   }
 
@@ -992,9 +1794,16 @@
   function updateWbWriteControls() {
     if (!wbEl) return;
 
-    var snap = getCurrentWbSnap();
     var writeButton = wbEl.querySelector('#mufy-wb-write-btn');
     var undoButton = wbEl.querySelector('#mufy-wb-undo-write-btn');
+
+    if (wbCurrentInteraction) {
+      if (writeButton) { writeButton.disabled = true; writeButton.textContent = '写入当前字段到 Mufy'; }
+      if (undoButton) undoButton.disabled = true;
+      return;
+    }
+
+    var snap = getCurrentWbSnap();
 
     if (writeButton) {
       writeButton.disabled = wbWritePending || !snap;
@@ -1010,7 +1819,7 @@
         snap.syncStatus === 'synced' &&
         snap.draftContent === snap.syncedContent
       );
-      undoButton.disabled = !canUndo;
+      undoButton.style.display = canUndo ? '' : 'none';
     }
   }
 
@@ -1161,12 +1970,250 @@
 
   function closeWorkbench() {
     var editor = wbEl && wbEl.querySelector('#mufy-wb-editor');
-    if (editor && wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
+    if (editor && !wbCurrentInteraction && wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
       wbSnapshot[wbCurrentIndex].draftContent = editor.value;
     }
-
+    if (wbCurrentInteraction) flushInteractionFormToDraft();
     clearWbTokenTimer();
     wbEl.classList.remove('open');
+  }
+
+  function showNormalEditor() {
+    if (!wbEl) return;
+    wbEl.querySelector('#mufy-wb-editor').style.display = '';
+    wbEl.querySelector('#mufy-wb-action-bar').style.display = '';
+    wbEl.querySelector('#mufy-wb-interaction-form').style.display = 'none';
+    var restoreBtn = wbEl.querySelector('#mufy-wb-restore');
+    if (restoreBtn) restoreBtn.textContent = '还原当前字段草稿';
+  }
+
+  /* ─── 交互大编辑器辅助 ─── */
+
+  function renderIxnTabBar(snap) {
+    var bar = wbEl && wbEl.querySelector('#mufy-ixn-tab-bar');
+    if (!bar) return;
+    bar.innerHTML = '';
+    var cur = wbCurrentInteractionEditorTarget;
+
+    /* 提示词 tab */
+    var pt = document.createElement('button');
+    pt.type = 'button';
+    pt.className = 'mufy-ixn-tab' + (cur && cur.kind === 'prompt' ? ' active' : '');
+    pt.dataset.kind = 'prompt';
+    pt.textContent = '提示词';
+    bar.appendChild(pt);
+
+    /* 文案 tabs */
+    (snap.draftData.afterCopywriting || []).forEach(function (text, i) {
+      var tb = document.createElement('button');
+      tb.type = 'button';
+      tb.className = 'mufy-ixn-tab' + (cur && cur.kind === 'afterCopywriting' && cur.copywritingIndex === i ? ' active' : '');
+      tb.dataset.kind = 'afterCopywriting';
+      tb.dataset.index = String(i);
+
+      var lbl = document.createTextNode('文案 ' + (i + 1) + ' ');
+      tb.appendChild(lbl);
+
+      var x = document.createElement('span');
+      x.className = 'mufy-ixn-tab-del';
+      x.dataset.delIndex = String(i);
+      x.textContent = '×';
+      tb.appendChild(x);
+
+      bar.appendChild(tb);
+    });
+
+    /* 新增文案按钮 */
+    var addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'mufy-ixn-tab-add';
+    addBtn.textContent = '+ 增加文案';
+    bar.appendChild(addBtn);
+  }
+
+  function loadIxnMainEditor(snap) {
+    var editor = wbEl && wbEl.querySelector('#mufy-ixn-main-editor');
+    if (!editor) return;
+    var t = wbCurrentInteractionEditorTarget;
+    if (!t) return;
+    if (t.kind === 'prompt') {
+      editor.value = snap.draftData.prompt || '';
+      editor.placeholder = '提示词内容…';
+    } else if (t.kind === 'afterCopywriting' && t.copywritingIndex != null) {
+      editor.value = (snap.draftData.afterCopywriting || [])[t.copywritingIndex] || '';
+      editor.placeholder = '文案 ' + (t.copywritingIndex + 1) + ' 内容…';
+    }
+  }
+
+  function getCurrentIxnEditorText(snap) {
+    var t = wbCurrentInteractionEditorTarget;
+    if (!t) return snap.draftData.prompt || '';
+    if (t.kind === 'prompt') return snap.draftData.prompt || '';
+    if (t.kind === 'afterCopywriting' && t.copywritingIndex != null) {
+      return (snap.draftData.afterCopywriting || [])[t.copywritingIndex] || '';
+    }
+    return '';
+  }
+
+  function getCurrentIxnEditorLabel() {
+    var t = wbCurrentInteractionEditorTarget;
+    if (!t || t.kind === 'prompt') return '"提示词"';
+    if (t.kind === 'afterCopywriting' && t.copywritingIndex != null) {
+      return '"文案 ' + (t.copywritingIndex + 1) + '"';
+    }
+    return '"提示词"';
+  }
+
+  function renderIxnCwList(arr, focusIndex) {
+    if (!wbEl) return;
+    var list = wbEl.querySelector('#mufy-ixn-cw-list');
+    if (!list) return;
+    list.innerHTML = '';
+    arr.forEach(function (text, i) {
+      var hdr = document.createElement('div');
+      hdr.className = 'mufy-ixn-label-row';
+
+      var lbl = document.createElement('span');
+      lbl.className = 'mufy-ixn-label';
+      lbl.textContent = '使用后文案 ' + (i + 1);
+
+      var copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'mufy-ixn-copy-btn';
+      copyBtn.textContent = '复制';
+      copyBtn.addEventListener('click', function () {
+        var snap = getCurrentIxnSnap();
+        if (!snap) return;
+        copyRawDraftText(snap.draftData.afterCopywriting[i] || '', '已复制使用后文案 ' + (i + 1) + '。');
+      });
+
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'mufy-ixn-cw-del';
+      del.textContent = '删除';
+      del.addEventListener('click', function () {
+        var snap = getCurrentIxnSnap();
+        if (!snap) return;
+        snap.draftData.afterCopywriting.splice(i, 1);
+        markIxnDirty(snap);
+        renderIxnCwList(snap.draftData.afterCopywriting);
+      });
+
+      hdr.appendChild(lbl);
+      hdr.appendChild(copyBtn);
+      hdr.appendChild(del);
+
+      var row = document.createElement('div');
+      row.className = 'mufy-ixn-cw-row';
+
+      var ta = document.createElement('textarea');
+      ta.className = 'mufy-ixn-cw-textarea';
+      ta.value = text;
+      ta.placeholder = '文案 ' + (i + 1);
+      ta.addEventListener('input', function () {
+        var snap = getCurrentIxnSnap();
+        if (!snap) return;
+        snap.draftData.afterCopywriting[i] = ta.value;
+        markIxnDirty(snap);
+      });
+      ta.addEventListener('focus', function () {
+        if (wbCurrentInteraction) {
+          wbClipboardTarget = {
+            kind: 'afterCopywriting',
+            itemKey: wbCurrentInteraction.itemKey,
+            interactionKey: wbCurrentInteraction.interactionKey,
+            copywritingIndex: i
+          };
+        }
+      });
+
+      row.appendChild(ta);
+      list.appendChild(hdr);
+      list.appendChild(row);
+
+      if (focusIndex === i) ta.focus();
+    });
+  }
+
+  function flushIxnEditorToDraft(snap) {
+    if (!wbEl || !snap || !wbCurrentInteractionEditorTarget) return;
+    var mainEditor = wbEl.querySelector('#mufy-ixn-main-editor');
+    if (!mainEditor) return;
+    var t = wbCurrentInteractionEditorTarget;
+    if (t.kind === 'prompt') {
+      snap.draftData.prompt = mainEditor.value;
+    } else if (t.kind === 'afterCopywriting' && t.copywritingIndex != null) {
+      snap.draftData.afterCopywriting[t.copywritingIndex] = mainEditor.value;
+    }
+  }
+
+  function flushInteractionFormToDraft() {
+    if (!wbEl || !wbCurrentInteraction) return;
+    var snap = getCurrentIxnSnap();
+    if (!snap) return;
+    var nameEl = wbEl.querySelector('#mufy-ixn-name');
+    var actionEl = wbEl.querySelector('#mufy-ixn-after-action');
+    if (nameEl) snap.draftData.interactionName = nameEl.value;
+    if (actionEl) snap.draftData.afterAction = actionEl.checked;
+    flushIxnEditorToDraft(snap);
+    if (snap.syncStatus === 'clean') {
+      var isDirty = snap.draftData.interactionName !== snap.syncedData.interactionName ||
+        snap.draftData.prompt !== snap.syncedData.prompt ||
+        snap.draftData.afterAction !== snap.syncedData.afterAction;
+      if (isDirty) snap.syncStatus = 'dirty';
+    }
+  }
+
+  function showInteractionEditor() {
+    if (!wbEl || !wbCurrentInteraction) return;
+    var snap = getCurrentIxnSnap();
+    if (!snap) return;
+    var dd = snap.draftData;
+
+    wbEl.querySelector('#mufy-wb-editor').style.display = 'none';
+    wbEl.querySelector('#mufy-wb-action-bar').style.display = 'none';
+    var form = wbEl.querySelector('#mufy-wb-interaction-form');
+    form.style.display = 'flex';
+
+    var restoreBtn = wbEl.querySelector('#mufy-wb-restore');
+    if (restoreBtn) restoreBtn.textContent = '还原当前交互草稿';
+
+    form.querySelector('#mufy-ixn-name').value = dd.interactionName || '';
+    form.querySelector('#mufy-ixn-after-action').checked = !!dd.afterAction;
+    /* 默认进入提示词 tab */
+    if (!wbCurrentInteractionEditorTarget) {
+      wbCurrentInteractionEditorTarget = { kind: 'prompt', copywritingIndex: null };
+    }
+    renderIxnTabBar(snap);
+    loadIxnMainEditor(snap);
+
+    var statusEl = form.querySelector('#mufy-ixn-sync-status');
+    if (statusEl) statusEl.textContent = ixnSyncStatusText(snap.syncStatus);
+
+    var title = wbEl.querySelector('#mufy-wb-title');
+    if (title) title.textContent = '工作台 · 物品｜' + snap.itemName + ' · 交互｜' + (dd.interactionName || snap.interactionKey);
+
+    var ctx = wbEl.querySelector('#mufy-item-context');
+    if (ctx) { ctx.classList.remove('show'); ctx.innerHTML = ''; }
+  }
+
+  function selectWbInteraction(itemKey, interactionKey) {
+    if (!wbEl) return;
+    // Flush current state before switching
+    if (wbCurrentInteraction) {
+      flushInteractionFormToDraft();
+    } else if (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
+      var editor = wbEl.querySelector('#mufy-wb-editor');
+      if (editor) wbSnapshot[wbCurrentIndex].draftContent = editor.value;
+    }
+
+    wbCurrentInteraction = { itemKey: itemKey, interactionKey: interactionKey };
+    wbCurrentInteractionEditorTarget = null;  // 重置至默认 tab（提示词）
+    wbItemExpanded[itemKey] = true;
+
+    renderWbFieldList();
+    showInteractionEditor();
+    updateWbWriteControls();
   }
 
   var WB_DOT_COLOR = {
@@ -1176,6 +2223,32 @@
     failed: '#f87171',
     stale:  '#f87171'
   };
+
+  var IXN_DOT_COLOR = {
+    clean:         '#4a4a62',
+    dirty:         '#fbbf24',
+    sourceChanged: '#f97316'
+  };
+
+  function ixnSyncStatusText(status) {
+    if (status === 'dirty') return '有草稿';
+    if (status === 'sourceChanged') return 'Mufy 已变化';
+    return '未修改';
+  }
+
+  function getCurrentIxnSnap() {
+    if (!wbCurrentInteraction) return null;
+    var byItem = interactionSnapshotsByItemKey[wbCurrentInteraction.itemKey];
+    if (!byItem) return null;
+    return byItem[wbCurrentInteraction.interactionKey] || null;
+  }
+
+  function markIxnDirty(snap) {
+    if (snap.syncStatus !== 'sourceChanged') snap.syncStatus = 'dirty';
+    renderWbFieldList();
+    var statusEl = wbEl && wbEl.querySelector('#mufy-ixn-sync-status');
+    if (statusEl) statusEl.textContent = ixnSyncStatusText(snap.syncStatus);
+  }
 
   function itemStatus(records) {
     var status = 'clean';
@@ -1249,9 +2322,52 @@
     return item;
   }
 
+  function renderItemWorkbenchInteractionChild(snap) {
+    var item = document.createElement('div');
+    var isActive = !!(wbCurrentInteraction &&
+      wbCurrentInteraction.itemKey === snap.itemKey &&
+      wbCurrentInteraction.interactionKey === snap.interactionKey);
+    item.className = 'mufy-item-wb-child mufy-item-wb-ixn-child' + (isActive ? ' active' : '');
+
+    var dot = document.createElement('span');
+    dot.className = 'mufy-wb-dot';
+    dot.style.background = IXN_DOT_COLOR[snap.syncStatus] || '#4a4a62';
+
+    var dd = snap.draftData || {};
+    var label = document.createElement('span');
+    label.textContent = dd.interactionName || snap.interactionKey || '（未命名）';
+    label.title = snap.interactionKey;
+    label.style.overflow = 'hidden';
+    label.style.textOverflow = 'ellipsis';
+    label.style.whiteSpace = 'nowrap';
+    label.style.flex = '1';
+
+    var badge = document.createElement('span');
+    badge.className = 'mufy-ixn-sync-badge mufy-ixn-sync-' + snap.syncStatus;
+    badge.textContent = ixnSyncStatusText(snap.syncStatus);
+
+    item.appendChild(dot);
+    item.appendChild(label);
+    if (snap.syncStatus !== 'clean') item.appendChild(badge);
+    item.addEventListener('click', function () {
+      selectWbInteraction(snap.itemKey, snap.interactionKey);
+    });
+
+    return item;
+  }
+
   function renderItemWorkbenchCard(entity) {
     var card = document.createElement('div');
     card.className = 'mufy-item-wb-card';
+
+    var ixnMap = interactionSnapshotsByItemKey[entity.itemKey] || {};
+    var ixnList = Object.keys(ixnMap).map(function (k) { return ixnMap[k]; });
+    var ixnCount = ixnList.length;
+
+    var hasActiveIxn = !!(wbCurrentInteraction && wbCurrentInteraction.itemKey === entity.itemKey);
+    var expanded = !!wbItemExpanded[entity.itemKey] ||
+      entity.recordIndexes.indexOf(wbCurrentIndex) >= 0 ||
+      hasActiveIxn;
 
     var head = document.createElement('div');
     head.className = 'mufy-item-wb-head';
@@ -1272,9 +2388,11 @@
 
     var summary = document.createElement('span');
     summary.className = 'mufy-item-wb-summary';
-    summary.textContent = entity.records.length + ' 项 · ' + itemStatusText(status);
+    var summaryParts = [entity.records.length + ' 项'];
+    if (ixnCount) summaryParts.push('交互 ' + ixnCount);
+    summaryParts.push(itemStatusText(status));
+    summary.textContent = summaryParts.join(' · ');
 
-    var expanded = !!wbItemExpanded[entity.itemKey] || entity.recordIndexes.indexOf(wbCurrentIndex) >= 0;
     var toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'mufy-item-wb-toggle';
@@ -1294,9 +2412,29 @@
     if (expanded) {
       var children = document.createElement('div');
       children.className = 'mufy-item-wb-children';
+
+      if (ixnCount) {
+        var basicHdr = document.createElement('div');
+        basicHdr.className = 'mufy-item-wb-subheader';
+        basicHdr.textContent = '基础信息';
+        children.appendChild(basicHdr);
+      }
+
       entity.records.forEach(function (snap, pos) {
         children.appendChild(renderItemWorkbenchChild(snap, entity.recordIndexes[pos]));
       });
+
+      if (ixnCount) {
+        var ixnHdr = document.createElement('div');
+        ixnHdr.className = 'mufy-item-wb-subheader';
+        ixnHdr.textContent = '已采集交互 · ' + ixnCount;
+        children.appendChild(ixnHdr);
+
+        ixnList.forEach(function (snap) {
+          children.appendChild(renderItemWorkbenchInteractionChild(snap));
+        });
+      }
+
       card.appendChild(children);
     }
 
@@ -1364,34 +2502,38 @@
       return entry.field && entry.field.group === field.group;
     });
 
-    var title = document.createElement('div');
-    title.className = 'mufy-item-context-title';
-    title.textContent = '物品｜' + itemNameFromGroup(field.group, field.label);
-    title.title = field.group;
+    var nameSpan = document.createElement('span');
+    nameSpan.className = 'mufy-ctx-item-name';
+    nameSpan.textContent = '物品｜' + itemNameFromGroup(field.group, field.label);
+    nameSpan.title = field.group;
 
-    var tabs = document.createElement('div');
-    tabs.className = 'mufy-item-context-tabs';
-
+    var tabsDiv = document.createElement('div');
+    tabsDiv.className = 'mufy-ctx-tabs';
     entries.forEach(function (entry) {
       var tab = document.createElement('button');
       tab.type = 'button';
       tab.className = 'mufy-item-context-tab' + (entry.index === wbCurrentIndex ? ' active' : '');
       tab.textContent = entry.field.role || entry.snap.label.replace(/^物品｜[^｜]+｜/, '字段');
       tab.title = entry.snap.label;
-      tab.addEventListener('click', function () {
-        selectWbField(entry.index);
-      });
-      tabs.appendChild(tab);
+      tab.addEventListener('click', function () { selectWbField(entry.index); });
+      tabsDiv.appendChild(tab);
     });
 
-    var note = document.createElement('div');
-    note.className = 'mufy-item-context-note';
-    note.textContent = '当前仍按单字段安全写入 Mufy；名称、描述与后续交互字段不会被拼成一段文本。';
+    var moreBtn = document.createElement('button');
+    moreBtn.type = 'button';
+    moreBtn.className = 'mufy-ctx-more-btn';
+    moreBtn.textContent = '···';
+    moreBtn.title = '复制本物品草稿包';
+    moreBtn.addEventListener('click', function () {
+      var text = serializeItemDraftBundle(field.group);
+      if (!text) { toast('当前物品没有可复制的草稿'); return; }
+      copyRawDraftText(text, '已复制"' + itemNameFromGroup(field.group, field.label) + '"草稿包。');
+    });
 
     context.innerHTML = '';
-    context.appendChild(title);
-    context.appendChild(tabs);
-    context.appendChild(note);
+    context.appendChild(nameSpan);
+    context.appendChild(tabsDiv);
+    context.appendChild(moreBtn);
     context.classList.add('show');
   }
 
@@ -1401,11 +2543,15 @@
     clearWbTokenTimer();
     var editor = wbEl.querySelector('#mufy-wb-editor');
 
-    // 切换前先把编辑器内容存入当前字段的草稿
-    if (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
+    // 切换前保存当前状态
+    if (wbCurrentInteraction) {
+      flushInteractionFormToDraft();
+      wbCurrentInteraction = null;
+    } else if (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
       wbSnapshot[wbCurrentIndex].draftContent = editor.value;
     }
 
+    showNormalEditor();
     wbCurrentIndex = index;
     var snap = wbSnapshot[index];
     var selectedField = findFieldById(snap.fieldId);
@@ -1417,10 +2563,8 @@
     if (isItemField(selectedField)) {
       var role = selectedField.role || '字段';
       var itemName = itemNameFromGroup(selectedField.group, snap.label);
-      wbEl.querySelector('#mufy-wb-center-label').textContent = '当前字段：' + role;
       wbEl.querySelector('#mufy-wb-title').textContent = '工作台 · 物品｜' + itemName + ' · ' + role;
     } else {
-      wbEl.querySelector('#mufy-wb-center-label').textContent = snap.label;
       wbEl.querySelector('#mufy-wb-title').textContent = '工作台 · ' + snap.label;
     }
 
@@ -1564,8 +2708,8 @@
     style.id = 'mufy-helper-style';
     style.textContent = [
       /* ── 浮动面板 ── */
-      '#mufy-helper-toggle{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:#8b5cf6;color:#fff;font-size:20px;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2147483000;box-shadow:0 4px 14px rgba(0,0,0,.4);user-select:none}',
-      '#mufy-helper-panel{position:fixed;top:80px;right:24px;width:430px;max-height:78vh;background:#1b1b22;border:1px solid #3a3a46;border-radius:12px;z-index:2147483000;display:none;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e6e6ef;font-size:13px;box-shadow:0 8px 28px rgba(0,0,0,.5);overflow:hidden}',
+      '#mufy-helper-toggle{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:#8b5cf6;color:#fff;font-size:20px;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2147483000;box-shadow:0 4px 14px rgba(0,0,0,.4);user-select:none;pointer-events:auto}',
+      '#mufy-helper-panel{position:fixed;top:80px;right:24px;width:430px;max-height:78vh;background:#1b1b22;border:1px solid #3a3a46;border-radius:12px;z-index:2147483000;display:none;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e6e6ef;font-size:13px;box-shadow:0 8px 28px rgba(0,0,0,.5);overflow:hidden;pointer-events:auto}',
       '#mufy-helper-panel.open{display:flex}',
       '#mufy-helper-header{padding:10px 14px;background:#26263a;cursor:move;font-weight:600;display:flex;justify-content:space-between;align-items:center}',
       '#mufy-helper-header span.close{cursor:pointer;opacity:.7}',
@@ -1608,7 +2752,7 @@
       '@media (max-width:560px){#mufy-helper-panel{left:10px;right:10px;top:56px;width:auto;max-height:82vh}#mufy-helper-toggle{right:16px;bottom:16px}}',
 
       /* ── 全屏工作台 ── */
-      '#mufy-workbench{position:fixed;inset:0;background:#13131a;z-index:2147483100;display:none;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e6e6ef;font-size:13px}',
+      '#mufy-workbench{position:fixed;inset:0;background:#13131a;z-index:2147483100;display:none;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e6e6ef;font-size:13px;pointer-events:auto}',
       '#mufy-workbench.open{display:flex}',
 
       '#mufy-wb-topbar{height:50px;min-height:50px;background:#1a1a28;border-bottom:1px solid #2a2a3e;display:flex;align-items:center;gap:8px;padding:0 16px;flex-shrink:0}',
@@ -1625,15 +2769,15 @@
       '.mufy-wb-field-item.active{background:#28194a;color:#c4b5fd;border-left:3px solid #8b5cf6;padding-left:9px}',
       '.mufy-wb-dot{width:7px;height:7px;min-width:7px;border-radius:50%;display:inline-block}',
 
-      '#mufy-wb-center{flex:1;display:flex;flex-direction:column;padding:16px;gap:8px;overflow:hidden}',
-      '#mufy-wb-center-label{font-size:12px;color:#6b6b8a;padding-bottom:6px;border-bottom:1px solid #222236;flex-shrink:0}',
+      '#mufy-wb-center{flex:1;display:flex;flex-direction:column;padding:12px 16px 12px;gap:8px;overflow:hidden}',
       '#mufy-wb-editor{flex:1;width:100%;background:#1b1b28;color:#e6e6ef;border:1px solid #333350;border-radius:8px;padding:14px;font-size:14px;line-height:1.85;resize:none;box-sizing:border-box;font-family:inherit;outline:none}',
       '#mufy-wb-editor:focus{border-color:#8b5cf6}',
-      '#mufy-wb-write-row{display:flex;align-items:center;gap:10px;flex-shrink:0}',
+      '#mufy-wb-action-bar{display:flex;align-items:center;gap:8px;flex-shrink:0}',
       '#mufy-wb-write-btn{background:#059669;border:none;color:#fff;padding:8px 18px;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap}',
       '#mufy-wb-write-btn:hover{filter:brightness(1.12)}',
-      '#mufy-wb-write-btn:disabled,#mufy-wb-undo-write-btn:disabled{cursor:not-allowed;opacity:.45;filter:none}',
+      '#mufy-wb-write-btn:disabled{cursor:not-allowed;opacity:.45;filter:none}',
       '#mufy-wb-undo-write-btn{background:#34344a;border:none;color:#e6e6ef;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap}',
+      '#mufy-wb-copy-field{margin-left:auto}',
       '#mufy-wb-write-status{font-size:12px;color:#9a9aae}',
       '#mufy-wb-write-status.ok{color:#4ade80}',
       '#mufy-wb-write-status.err{color:#f87171}',
@@ -1662,13 +2806,79 @@
       '.mufy-item-wb-child{padding:8px 12px 8px 26px;cursor:pointer;border-bottom:1px solid #1d1c2b;font-size:12px;color:#aaa5c9;display:flex;align-items:center;gap:8px}',
       '.mufy-item-wb-child:hover{background:#1e1d31}',
       '.mufy-item-wb-child.active{background:#28194a;color:#d5cbff;border-left:3px solid #8b5cf6;padding-left:23px}',
-      '#mufy-item-context{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:9px 11px;border:1px solid #393254;border-radius:8px;background:#1a1928;flex-shrink:0}',
+      '#mufy-item-context{display:none;align-items:center;gap:8px;height:40px;padding:0 10px;border-bottom:1px solid #222236;background:#181826;flex-shrink:0;overflow:hidden}',
       '#mufy-item-context.show{display:flex}',
-      '.mufy-item-context-title{font-size:12px;color:#e5dfff;font-weight:600;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.mufy-item-context-tabs{display:flex;gap:6px;flex-wrap:wrap}',
-      '.mufy-item-context-tab{background:#302d45!important;color:#bdb6df!important;border:none;border-radius:5px;padding:4px 9px!important;font-size:12px!important;cursor:pointer}',
-      '.mufy-item-context-tab.active{background:#6d4bc2!important;color:#fff!important}',
-      '.mufy-item-context-note{width:100%;font-size:10px;color:#8f89ab;line-height:1.45}'
+      '.mufy-ctx-item-name{font-size:12px;color:#9e96d5;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px;flex-shrink:0}',
+      '.mufy-ctx-tabs{display:flex;gap:4px;flex-shrink:0}',
+      '.mufy-ctx-more-btn{margin-left:auto;background:transparent;border:none;color:#5a5a7a;font-size:16px;cursor:pointer;padding:0 6px;letter-spacing:2px;line-height:1;flex-shrink:0}',
+      '.mufy-ctx-more-btn:hover{color:#a78bfa}',
+      '.mufy-item-context-tab{background:#272540!important;color:#bdb6df!important;border:none;border-radius:5px;padding:3px 9px!important;font-size:12px!important;cursor:pointer}',
+      '.mufy-item-context-tab.active{background:#5a35ab!important;color:#fff!important}',
+      '.mufy-item-interaction-section{border-top:1px solid #2d2a40;padding:6px 9px 4px}',
+      '.mufy-item-interaction-header{display:flex;align-items:center;gap:7px;margin-bottom:4px}',
+      '.mufy-item-interaction-label{flex:1;font-size:11px;color:#9e96d5}',
+      '.mufy-item-interaction-row{padding:4px 0 2px;border-top:1px solid #26233a}',
+      '.mufy-interaction-name{font-size:11px;color:#cbc6e7;margin-right:6px}',
+      '.mufy-interaction-state-observed{font-size:10px;color:#fbbf24}',
+      '.mufy-interaction-state-saved{font-size:10px;color:#4ade80}',
+      '.mufy-interaction-detail{padding:3px 0 2px 10px}',
+      '.mufy-interaction-field{font-size:10px;color:#8a85a4;line-height:1.6}',
+      '.mufy-clear-interaction-btn{color:#f87171!important}',
+      '#mufy-interaction-hud{position:fixed;bottom:72px;right:18px;z-index:9999;background:#1e1a2e;border:1px solid #6d4bc2;border-radius:8px;padding:10px 14px;min-width:200px;max-width:260px;box-shadow:0 4px 16px rgba(0,0,0,.55);font-size:12px;color:#cbc6e7;display:none;pointer-events:auto}',
+      '.mufy-hud-title{font-weight:600;margin-bottom:4px;color:#a78bfa}',
+      '.mufy-hud-status{color:#9e96d5;margin-bottom:8px;font-size:11px;min-height:14px}',
+      '#mufy-hud-end-btn{width:100%;padding:4px 0;border-radius:5px;background:#6d4bc2;color:#fff;border:none;cursor:pointer;font-size:12px}',
+
+      /* ── 工作台交互子项 ── */
+      '.mufy-item-wb-subheader{padding:5px 12px 3px;font-size:10px;color:#6b6880;text-transform:uppercase;letter-spacing:.05em;background:#131320;border-top:1px solid #1e1c2e}',
+      '.mufy-item-wb-ixn-child{padding-left:24px!important}',
+
+      /* ── 交互同步状态 badge ── */
+      '.mufy-ixn-sync-badge{font-size:9px;padding:1px 5px;border-radius:999px;white-space:nowrap;margin-left:auto;flex-shrink:0}',
+      '.mufy-ixn-sync-dirty{background:#4a3a00;color:#fbbf24}',
+      '.mufy-ixn-sync-sourceChanged{background:#4a2500;color:#f97316}',
+
+      /* ── 交互编辑表单 ── */
+      '#mufy-wb-interaction-form{display:none;flex-direction:column;gap:8px;flex:1;min-height:0;overflow:hidden;padding:12px 14px;background:#13131a}',
+      '.mufy-ixn-name-row{display:flex;align-items:center;gap:8px;flex-shrink:0}',
+      '.mufy-ixn-name-row .mufy-ixn-label{white-space:nowrap;flex-shrink:0}',
+      '.mufy-ixn-name-row .mufy-ixn-input{flex:1;min-width:0}',
+      '.mufy-ixn-field-group{display:flex;flex-direction:column;gap:4px;flex-shrink:0}',
+      '.mufy-ixn-label{font-size:11px;color:#7b769a;font-weight:600;text-transform:uppercase;letter-spacing:.05em}',
+      '.mufy-ixn-input{background:#1b1b28;color:#e6e6ef;border:1px solid #333350;border-radius:6px;padding:7px 10px;font-size:13px;font-family:inherit;outline:none}',
+      '.mufy-ixn-input:focus{border-color:#8b5cf6}',
+      /* Tab 栏 */
+      '#mufy-ixn-tab-bar{display:flex;gap:4px;flex-wrap:wrap;flex-shrink:0;padding-bottom:2px}',
+      '.mufy-ixn-tab{background:#272540;border:none;color:#9e96d5;border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer;white-space:nowrap;display:flex;align-items:center;gap:5px}',
+      '.mufy-ixn-tab.active{background:#5a35ab;color:#fff}',
+      '.mufy-ixn-tab:hover:not(.active){background:#333254;color:#d9d3ff}',
+      '.mufy-ixn-tab-del{font-size:13px;line-height:1;opacity:.7;padding:0 1px}',
+      '.mufy-ixn-tab-del:hover{opacity:1;color:#fca5a5}',
+      '.mufy-ixn-tab-add{background:#1e1c2e;border:1px dashed #3d3a58;color:#7b769a;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;white-space:nowrap}',
+      '.mufy-ixn-tab-add:hover{border-color:#8b5cf6;color:#c4b5fd}',
+      /* 大主编辑器 */
+      '#mufy-ixn-main-editor{flex:1;min-height:0;width:100%;box-sizing:border-box;background:#1b1b28;color:#e6e6ef;border:1px solid #333350;border-radius:6px;padding:10px 12px;font-size:13px;line-height:1.75;resize:none;font-family:inherit;outline:none}',
+      '#mufy-ixn-main-editor:focus{border-color:#8b5cf6}',
+      '.mufy-ixn-action-row{flex-direction:row;align-items:center;gap:12px;flex-shrink:0}',
+      '.mufy-ixn-checkbox-label{display:flex;align-items:center;gap:6px;cursor:pointer;color:#cbc6e7;font-size:13px}',
+      '.mufy-ixn-status-row{display:flex;align-items:center;gap:8px;flex-shrink:0}',
+      '.mufy-ixn-sync-text{font-size:11px;color:#8f8aac}',
+      '.mufy-ixn-write-note{font-size:11px;color:#7c6a2e;background:#2a2010;border:1px solid #4a3a10;border-radius:6px;padding:7px 9px;line-height:1.5;flex-shrink:0}',
+
+      /* ── 专注编辑模式 ── */
+      '#mufy-workbench.mufy-wb-focus #mufy-wb-left{display:none!important}',
+      '#mufy-workbench.mufy-wb-focus #mufy-wb-right{display:none!important}',
+      '#mufy-workbench.mufy-wb-focus #mufy-wb-center{flex:1;max-width:100%;padding:0 24px}',
+
+
+      /* ── 交互字段标签行（label + 复制按钮） ── */
+      '.mufy-ixn-label-row{display:flex;align-items:center;justify-content:space-between;gap:6px}',
+      '.mufy-ixn-copy-btn{background:#29263e!important;color:#9b96c8!important;border:none!important;border-radius:5px!important;padding:2px 8px!important;font-size:11px!important;cursor:pointer!important;white-space:nowrap;line-height:1.5}',
+      '.mufy-ixn-copy-btn:hover{background:#353254!important;color:#d9d3ff!important}',
+
+      /* ── 交互表单页脚 ── */
+      '.mufy-ixn-footer{display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap}',
+      '.mufy-ixn-footer button{flex:1;min-width:120px}'
     ].join('');
     document.head.appendChild(style);
   }
@@ -1721,7 +2931,7 @@
     checkbox.checked = field.enabled;
     checkbox.addEventListener('change', function () {
       field.enabled = checkbox.checked;
-      if (compact) renderList();
+      renderList();
     });
 
     row.appendChild(checkbox);
@@ -1797,6 +3007,93 @@
     };
   }
 
+  function renderInteractionSection(entity) {
+    var snaps = interactionSnapshotsByItemKey[entity.itemKey] || {};
+    var snapList = Object.keys(snaps).map(function (k) { return snaps[k]; });
+    var count = snapList.length;
+
+    var section = document.createElement('div');
+    section.className = 'mufy-item-interaction-section';
+
+    var header = document.createElement('div');
+    header.className = 'mufy-item-interaction-header';
+
+    var label = document.createElement('span');
+    label.className = 'mufy-item-interaction-label';
+    label.textContent = '交互：已采集 ' + count + ' 项';
+
+    var isActiveSession = interactionCaptureSession &&
+      interactionCaptureSession.itemKey === entity.itemKey;
+
+    var captureBtn = document.createElement('button');
+    captureBtn.type = 'button';
+    captureBtn.className = 'mufy-item-card-toggle';
+    if (isActiveSession) {
+      captureBtn.textContent = '结束采集';
+      captureBtn.title = '结束当前采集会话';
+      captureBtn.addEventListener('click', endInteractionCaptureSession);
+    } else {
+      captureBtn.textContent = '采集交互';
+      captureBtn.title = '先点此按钮，再在 Mufy 中打开该物品的交互编辑窗';
+      captureBtn.addEventListener('click', function () {
+        startInteractionCaptureSession(entity);
+      });
+    }
+
+    header.appendChild(label);
+    header.appendChild(captureBtn);
+
+    if (count > 0) {
+      var clearBtn = document.createElement('button');
+      clearBtn.type = 'button';
+      clearBtn.className = 'mufy-item-card-toggle mufy-clear-interaction-btn';
+      clearBtn.textContent = '清空交互';
+      clearBtn.title = '清空"' + entity.itemName + '"已采集的全部交互快照';
+      clearBtn.addEventListener('click', function () {
+        clearItemInteractionSnapshots(entity);
+      });
+      header.appendChild(clearBtn);
+    }
+
+    section.appendChild(header);
+
+    snapList.forEach(function (snap) {
+      var row = document.createElement('div');
+      row.className = 'mufy-item-interaction-row';
+
+      var sd = snap.syncedData || {};
+      var stateText = snap.captureState === 'saved' ? '已保存' : '已读取';
+      var stateClass = snap.captureState === 'saved' ? 'mufy-interaction-state-saved' : 'mufy-interaction-state-observed';
+
+      row.innerHTML =
+        '<span class="mufy-interaction-name">▾ ' + escapeHtml(sd.interactionName || snap.interactionKey || '（未命名）') + '</span>' +
+        '<span class="' + stateClass + '">' + stateText + '</span>';
+
+      var detail = document.createElement('div');
+      detail.className = 'mufy-interaction-detail';
+
+      var promptLine = document.createElement('div');
+      promptLine.className = 'mufy-interaction-field';
+      promptLine.textContent = '提示词：' + (sd.prompt ? '已采集' : '（空）');
+      detail.appendChild(promptLine);
+
+      var cwLine = document.createElement('div');
+      cwLine.className = 'mufy-interaction-field';
+      cwLine.textContent = '使用后文案：' + (sd.afterCopywriting ? sd.afterCopywriting.length : 0) + ' 条';
+      detail.appendChild(cwLine);
+
+      var actLine = document.createElement('div');
+      actLine.className = 'mufy-interaction-field';
+      actLine.textContent = '使用后操作：' + (sd.afterAction ? '关闭' : '不操作');
+      detail.appendChild(actLine);
+
+      row.appendChild(detail);
+      section.appendChild(row);
+    });
+
+    return section;
+  }
+
   function renderItemCard(entity) {
     var card = document.createElement('div');
     card.className = 'mufy-item-card';
@@ -1846,10 +3143,7 @@
     head.appendChild(toggle);
     card.appendChild(head);
 
-    var note = document.createElement('div');
-    note.className = 'mufy-item-card-note';
-    note.textContent = '交互提示词与使用后文案需打开对应交互编辑窗后再采集。';
-    card.appendChild(note);
+    card.appendChild(renderInteractionSection(entity));
 
     if (expanded) {
       var children = document.createElement('div');
@@ -1867,7 +3161,7 @@
     if (!listEl) return;
 
     var title = panelEl ? panelEl.querySelector('#mufy-helper-header span') : null;
-    if (title) title.textContent = '🧩 Mufy 字段助手 V0.5.10';
+    if (title) title.textContent = '🧩 Mufy 字段助手 V0.5.17';
 
     listEl.innerHTML = '';
 
@@ -1909,8 +3203,9 @@
 
     var selectAllBtn = panelEl && panelEl.querySelector('#mufy-helper-select-all');
     if (selectAllBtn) {
-      selectAllBtn.textContent = (fields.length > 0 && fields.every(function (f) { return f.enabled; }))
-        ? '取消全选' : '全选';
+      var selectable = getSelectableFields();
+      var allSelectableOn = selectable.length > 0 && selectable.every(function (f) { return f.enabled; });
+      selectAllBtn.textContent = allSelectableOn ? '取消全选' : '全选可用字段';
     }
   }
 
@@ -1921,7 +3216,7 @@
     panelEl.id = 'mufy-helper-panel';
     panelEl.innerHTML = [
       '<div id="mufy-helper-header">',
-      '<span>🧩 Mufy 字段助手 V0.5.10</span>',
+      '<span>🧩 Mufy 字段助手 V0.5.17</span>',
       '<span class="close">✕</span>',
       '</div>',
       '<div id="mufy-helper-toolbar">',
@@ -1987,16 +3282,17 @@
     });
 
     var selectAllBtn = panelEl.querySelector('#mufy-helper-select-all');
-    function updateSelectAllLabel() {
-      var allOn = fields.length > 0 && fields.every(function (f) { return f.enabled; });
-      selectAllBtn.textContent = allOn ? '取消全选' : '全选';
-    }
     selectAllBtn.addEventListener('click', function () {
       if (!fields.length) { toast('请先扫描字段'); return; }
-      var allOn = fields.every(function (f) { return f.enabled; });
-      fields.forEach(function (f) { f.enabled = !allOn; });
+      var selectable = getSelectableFields();
+      var unsafe = fields.filter(function (f) { return f.isUnrecognized || f.needsReview; });
+      var allSelectableOn = selectable.length > 0 && selectable.every(function (f) { return f.enabled; });
+      selectable.forEach(function (f) { f.enabled = !allSelectableOn; });
+      unsafe.forEach(function (f) { f.enabled = false; });
       renderList();
-      updateSelectAllLabel();
+      if (!allSelectableOn && unsafe.length) {
+        toast('已选中 ' + selectable.length + ' 个可用字段；' + unsafe.length + ' 个待确认字段保持未选');
+      }
     });
 
     var pasteBox = panelEl.querySelector('#mufy-helper-paste');
@@ -2154,6 +3450,18 @@
       });
     });
     observer.observe(document.body, { childList: true });
+
+    // 交互弹窗检测：subtree，仅 arm/activeDialog 非空时实际执行
+    var interactionObserver = new MutationObserver(function () {
+      if (!interactionCaptureSession && !activeInteractionDialog) return;
+      if (interactionObserverQueued) return;
+      interactionObserverQueued = true;
+      requestAnimationFrame(function () {
+        interactionObserverQueued = false;
+        checkForInteractionDialog();
+      });
+    });
+    interactionObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   init();
