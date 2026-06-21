@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.5.3
+// @version      0.5.4
 // @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台、三态草稿层与安全单字段注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
@@ -636,7 +636,7 @@
       '<div id="mufy-wb-topbar">',
       '  <button id="mufy-wb-exit">← 退出工作台</button>',
       '  <button id="mufy-wb-copy-llm" class="secondary">复制给 LLM</button>',
-      '  <button id="mufy-wb-restore" class="secondary">还原草稿至同步版本</button>',
+      '  <button id="mufy-wb-restore" class="secondary" title="放弃当前字段尚未写入 Mufy 的编辑，恢复到最近一次成功同步的版本。">还原当前字段草稿</button>',
       '  <button id="mufy-wb-discard" class="secondary">放弃草稿</button>',
       '  <span id="mufy-wb-title" class="wb-title">工作台</span>',
       '</div>',
@@ -724,19 +724,6 @@
       renderWbFieldList();
       updateWbRightPanel();
       toast('已将"' + snap.label + '"还原至当前同步版本');
-    });
-
-    /* 放弃草稿：draft → syncedContent（V0.6.2 引入 LLM 回填后两者语义会分化） */
-    wbEl.querySelector('#mufy-wb-discard').addEventListener('click', function () {
-      if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return;
-      var snap = wbSnapshot[wbCurrentIndex];
-      snap.draftContent = snap.syncedContent;
-      snap.syncStatus = 'clean';
-      wbEl.querySelector('#mufy-wb-editor').value = snap.syncedContent;
-      setWbWriteStatus('', '');
-      renderWbFieldList();
-      updateWbRightPanel();
-      toast('已放弃"' + snap.label + '"的草稿，恢复至当前同步版本');
     });
 
     /* 写入当前字段到 Mufy */
@@ -1249,7 +1236,7 @@
     panelEl.id = 'mufy-helper-panel';
     panelEl.innerHTML = [
       '<div id="mufy-helper-header">',
-      '<span>🧩 Mufy 字段助手 V0.5.3</span>',
+      '<span>🧩 Mufy 字段助手 V0.5.4</span>',
       '<span class="close">✕</span>',
       '</div>',
       '<div id="mufy-helper-toolbar">',
@@ -1453,7 +1440,7 @@
   }
 
   /* ─── 初始化 ─── */
-  /* ─── V0.5.3｜单字段注入安全层 ─── */
+  /* ─── V0.5.4｜单字段注入安全层 ─── */
 
   var wbLastWriteUndo = null;
   var wbWritePending = false;
@@ -1531,7 +1518,7 @@
       : null;
 
     if (helperTitle) {
-      helperTitle.textContent = '🧩 Mufy 字段助手 V0.5.3';
+      helperTitle.textContent = '🧩 Mufy 字段助手 V0.5.4';
     }
 
     var row = wbEl.querySelector('#mufy-wb-write-row');
@@ -1567,7 +1554,7 @@
       });
     }
 
-    ['#mufy-wb-restore', '#mufy-wb-discard'].forEach(function (selector) {
+    ['#mufy-wb-restore'].forEach(function (selector) {
       var button = wbEl.querySelector(selector);
 
       if (!button || button.dataset.v051UndoBound) return;
