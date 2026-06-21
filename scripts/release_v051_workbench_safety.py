@@ -1,2 +1,2 @@
 import subprocess
-subprocess.check_call(['node', 'scripts/v056_item_aggregation.mjs'])
+subprocess.check_call(['node', 'scripts/v057_item_groups.mjs'])
