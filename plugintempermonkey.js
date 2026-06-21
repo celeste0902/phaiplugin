@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mufy 角色卡编辑助手
 // @namespace    mufy-card-helper
-// @version      0.2.2
-// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段
+// @version      0.3.0
+// @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含全屏工作台
 // @match        https://chat.mufy.ai/create*
 // @grant        none
 // ==/UserScript==
@@ -11,19 +11,33 @@
   'use strict';
 
   /*
-    V0.2.2 目标：
-    1. 未识别字段默认不勾选，避免误送 LLM / 误写回。
-    2. 对“默认认知”的主内容、条目标题、条目内容做语义分组。
-    3. 对“物品名称 + 物品描述”做同卡分组。
-    4. 保留 V0.2.1 的预览、确认、撤销、失效节点保护和 SPA 自修复。
+    V0.3.0 新增：全屏工作台外壳（步骤 1）
+    - 只做打开 / 关闭 / 布局，不改变现有写入逻辑。
+    - 进入时把已勾选字段快照一份，工作台里读快照不碰 Mufy DOM。
+    - 退出时直接关闭覆盖层，Mufy 页面零影响。
+    - 步骤 1 切换字段不保留编辑内容，草稿层留给步骤 2。
 
-    不做跨刷新字段绑定。Mufy 懒挂载会改变节点数量和顺序，序号持久化不安全。
+    V0.2.2 沿用：
+    - 未识别字段默认不勾选。
+    - 默认认知 / 物品字段语义分组。
+    - 预览→确认→撤销三段式写入，写前检查 isConnected。
+    - MutationObserver + rAF 自修复 UI。
   */
+
+  /* ─── 全局状态 ─── */
 
   var fields = [];
   var lastSnapshot = null;
   var panelEl = null;
   var listEl = null;
+
+  // 工作台状态（步骤 1）
+  var wbEl = null;
+  var wbCurrentIndex = -1;
+  // wbSnapshot 条目：{ label, originalContent }
+  var wbSnapshot = [];
+
+  /* ─── 工具函数 ─── */
 
   function asText(value) {
     return String(value || '');
@@ -243,6 +257,17 @@
     return ok;
   }
 
+  function escapeHtml(value) {
+    return asText(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  /* ─── 字段身份标注 ─── */
+
   function assignFieldIdentity(field, label, group, role, options) {
     var opts = options || {};
 
@@ -452,6 +477,8 @@
     });
   }
 
+  /* ─── 字段扫描 ─── */
+
   function scanFields() {
     var selector =
       'textarea, input[type="text"], input:not([type]), [contenteditable="true"]';
@@ -459,7 +486,8 @@
     var nodes = Array.from(document.querySelectorAll(selector)).filter(function (el) {
       return isVisible(el) &&
         !el.closest('#mufy-helper-panel') &&
-        !el.closest('#mufy-helper-toggle');
+        !el.closest('#mufy-helper-toggle') &&
+        !el.closest('#mufy-workbench');  // 排除工作台自身输入框
     });
 
     fields = nodes.map(function (el, index) {
@@ -537,6 +565,8 @@
     return '未找到可用字段标题';
   }
 
+  /* ─── 取色器（手动重绑） ─── */
+
   function startPicker(onPick) {
     document.body.style.cursor = 'crosshair';
 
@@ -595,12 +625,14 @@
     document.addEventListener('keydown', keydown, true);
   }
 
+  /* ─── Markdown 构建 / 解析 ─── */
+
   function buildMarkdown() {
     var selected = getEnabledFields();
 
     var header = [
       '以下仅包含本次已选中的角色卡字段。',
-      '请按需修改，并严格使用“## 字段名”作为分隔标题原样返回这些字段。',
+      '请按需修改，并严格使用"## 字段名"作为分隔标题原样返回这些字段。',
       '未修改字段也请保留原文返回。不要新增未列出的字段，不要改写字段标题，不要添加解释、前言或结语。',
       ''
     ].join('\n');
@@ -745,6 +777,189 @@
     return count;
   }
 
+  /* ─── 全屏工作台（步骤 1） ─── */
+
+  function buildWorkbench() {
+    wbEl = document.createElement('div');
+    wbEl.id = 'mufy-workbench';
+
+    wbEl.innerHTML = [
+      '<div id="mufy-wb-topbar">',
+      '  <button id="mufy-wb-exit">← 退出工作台</button>',
+      '  <button id="mufy-wb-copy-llm" class="secondary">复制给 LLM</button>',
+      '  <button id="mufy-wb-restore" class="secondary">恢复当前字段</button>',
+      '  <span id="mufy-wb-title" class="wb-title">工作台</span>',
+      '</div>',
+      '<div id="mufy-wb-body">',
+      '  <div id="mufy-wb-left">',
+      '    <div id="mufy-wb-field-list"></div>',
+      '  </div>',
+      '  <div id="mufy-wb-center">',
+      '    <div id="mufy-wb-center-label"></div>',
+      '    <textarea id="mufy-wb-editor" placeholder="从左侧选择一个字段…"></textarea>',
+      '  </div>',
+      '  <div id="mufy-wb-right">',
+      '    <div class="wb-info-block">',
+      '      <div class="wb-info-title">原文字数</div>',
+      '      <div id="mufy-wb-orig-len">—</div>',
+      '    </div>',
+      '    <div class="wb-info-block">',
+      '      <div class="wb-info-title">当前字数</div>',
+      '      <div id="mufy-wb-cur-len">—</div>',
+      '    </div>',
+      '    <div class="wb-info-block">',
+      '      <div class="wb-info-title">同步状态</div>',
+      '      <div id="mufy-wb-sync-status">未同步</div>',
+      '    </div>',
+      '    <div class="wb-info-block wb-info-note">',
+      '      步骤 1：工作台仅读取快照，编辑内容暂不写回 Mufy。',
+      '    </div>',
+      '  </div>',
+      '</div>'
+    ].join('');
+
+    document.body.appendChild(wbEl);
+
+    /* 退出 */
+    wbEl.querySelector('#mufy-wb-exit').addEventListener('click', function () {
+      closeWorkbench();
+    });
+
+    /* 复制给 LLM：从快照构建 Markdown，与 Mufy 页面当前状态无关 */
+    wbEl.querySelector('#mufy-wb-copy-llm').addEventListener('click', function () {
+      if (!wbSnapshot.length) {
+        toast('工作台里没有字段');
+        return;
+      }
+
+      var header = [
+        '以下仅包含本次已选中的角色卡字段。',
+        '请按需修改，并严格使用"## 字段名"作为分隔标题原样返回这些字段。',
+        '未修改字段也请保留原文返回。不要新增未列出的字段，不要改写字段标题，不要添加解释、前言或结语。',
+        ''
+      ].join('\n');
+
+      var body = wbSnapshot.map(function (snap) {
+        return '## ' + snap.label + '\n\n' + snap.originalContent + '\n';
+      }).join('\n');
+
+      copyText(header + '\n' + body).then(function (ok) {
+        toast(ok ? '已复制工作台字段，可粘贴给 LLM' : '复制失败，请手动选择文本');
+      });
+    });
+
+    /* 恢复当前字段：把编辑器内容还原为进入工作台时的快照 */
+    wbEl.querySelector('#mufy-wb-restore').addEventListener('click', function () {
+      if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return;
+
+      var editor = wbEl.querySelector('#mufy-wb-editor');
+      editor.value = wbSnapshot[wbCurrentIndex].originalContent;
+
+      updateWbRightPanel();
+      toast('已恢复"' + wbSnapshot[wbCurrentIndex].label + '"的初始内容');
+    });
+
+    /* 编辑器字数实时更新 */
+    wbEl.querySelector('#mufy-wb-editor').addEventListener('input', function () {
+      updateWbRightPanel();
+    });
+  }
+
+  function openWorkbench() {
+    var enabled = getEnabledFields();
+
+    if (!enabled.length) {
+      toast('当前没有勾选字段，请先在面板里勾选要编辑的字段');
+      return;
+    }
+
+    // 快照：只读取当前 Mufy DOM 内容，进入工作台后与 Mufy 解耦
+    wbSnapshot = enabled.map(function (field) {
+      return {
+        label: field.label,
+        originalContent: getValue(field.el)
+      };
+    });
+
+    wbCurrentIndex = -1;
+
+    renderWbFieldList();
+
+    wbEl.classList.add('open');
+
+    // 自动选中第一个字段
+    selectWbField(0);
+  }
+
+  function closeWorkbench() {
+    wbEl.classList.remove('open');
+    wbCurrentIndex = -1;
+    wbSnapshot = [];
+  }
+
+  function renderWbFieldList() {
+    var listEl = wbEl.querySelector('#mufy-wb-field-list');
+    listEl.innerHTML = '';
+
+    wbSnapshot.forEach(function (snap, index) {
+      var item = document.createElement('div');
+      item.className = 'mufy-wb-field-item';
+      item.textContent = snap.label;
+      item.title = snap.label;
+      item.dataset.index = index;
+
+      item.addEventListener('click', function () {
+        selectWbField(index);
+      });
+
+      listEl.appendChild(item);
+    });
+  }
+
+  function selectWbField(index) {
+    if (index < 0 || index >= wbSnapshot.length) return;
+
+    wbCurrentIndex = index;
+
+    var snap = wbSnapshot[index];
+    var editor = wbEl.querySelector('#mufy-wb-editor');
+    var label = wbEl.querySelector('#mufy-wb-center-label');
+    var title = wbEl.querySelector('#mufy-wb-title');
+
+    editor.value = snap.originalContent;
+    label.textContent = snap.label;
+    title.textContent = '工作台 · ' + snap.label;
+
+    // 左侧高亮
+    var items = wbEl.querySelectorAll('.mufy-wb-field-item');
+    items.forEach(function (item) {
+      item.classList.toggle('active', Number(item.dataset.index) === index);
+    });
+
+    updateWbRightPanel();
+    editor.focus();
+  }
+
+  function updateWbRightPanel() {
+    if (wbCurrentIndex < 0) return;
+
+    var editor = wbEl.querySelector('#mufy-wb-editor');
+    var origLen = wbEl.querySelector('#mufy-wb-orig-len');
+    var curLen = wbEl.querySelector('#mufy-wb-cur-len');
+
+    var orig = wbSnapshot[wbCurrentIndex].originalContent.length;
+    var cur = editor.value.length;
+
+    origLen.textContent = orig + ' 字';
+    curLen.textContent = cur + ' 字';
+
+    var syncEl = wbEl.querySelector('#mufy-wb-sync-status');
+    syncEl.textContent = '未同步';
+    syncEl.style.color = '#9a9aae';
+  }
+
+  /* ─── 样式注入 ─── */
+
   function injectStyleOnce() {
     if (document.getElementById('mufy-helper-style')) return;
 
@@ -753,6 +968,7 @@
     style.id = 'mufy-helper-style';
 
     style.textContent = [
+      /* ── 浮动面板 ── */
       '#mufy-helper-toggle{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:#8b5cf6;color:#fff;font-size:20px;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2147483000;box-shadow:0 4px 14px rgba(0,0,0,.4);user-select:none}',
       '#mufy-helper-panel{position:fixed;top:80px;right:24px;width:430px;max-height:78vh;background:#1b1b22;border:1px solid #3a3a46;border-radius:12px;z-index:2147483000;display:none;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e6e6ef;font-size:13px;box-shadow:0 8px 28px rgba(0,0,0,.5);overflow:hidden}',
       '#mufy-helper-panel.open{display:flex}',
@@ -782,11 +998,41 @@
       '#mufy-helper-confirm-row button.secondary{background:#34344a}',
       '#mufy-helper-undo{display:none;width:100%;background:#5b3434;border:none;color:#fff;padding:6px 8px;border-radius:6px;cursor:pointer;font-size:12px}',
       '#mufy-helper-undo.show{display:block}',
-      '@media (max-width:560px){#mufy-helper-panel{left:10px;right:10px;top:56px;width:auto;max-height:82vh}#mufy-helper-toggle{right:16px;bottom:16px}}'
+      '@media (max-width:560px){#mufy-helper-panel{left:10px;right:10px;top:56px;width:auto;max-height:82vh}#mufy-helper-toggle{right:16px;bottom:16px}}',
+
+      /* ── 全屏工作台 ── */
+      '#mufy-workbench{position:fixed;inset:0;background:#13131a;z-index:2147483100;display:none;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e6e6ef;font-size:13px}',
+      '#mufy-workbench.open{display:flex}',
+
+      '#mufy-wb-topbar{height:50px;min-height:50px;background:#1a1a28;border-bottom:1px solid #2a2a3e;display:flex;align-items:center;gap:8px;padding:0 16px;flex-shrink:0}',
+      '#mufy-wb-topbar button{background:#8b5cf6;border:none;color:#fff;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap}',
+      '#mufy-wb-topbar button.secondary{background:#2e2e44}',
+      '#mufy-wb-topbar button:hover{filter:brightness(1.15)}',
+      '.wb-title{margin-left:auto;font-size:12px;color:#5a5a7a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px}',
+
+      '#mufy-wb-body{flex:1;display:flex;overflow:hidden}',
+
+      '#mufy-wb-left{width:220px;min-width:220px;border-right:1px solid #222236;overflow-y:auto;background:#161622;flex-shrink:0}',
+      '.mufy-wb-field-item{padding:11px 16px;cursor:pointer;border-bottom:1px solid #1c1c2e;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#b0b0cc;transition:background .12s}',
+      '.mufy-wb-field-item:hover{background:#1e1e32}',
+      '.mufy-wb-field-item.active{background:#28194a;color:#c4b5fd;border-left:3px solid #8b5cf6;padding-left:13px}',
+
+      '#mufy-wb-center{flex:1;display:flex;flex-direction:column;padding:16px;gap:8px;overflow:hidden}',
+      '#mufy-wb-center-label{font-size:12px;color:#6b6b8a;padding-bottom:4px;border-bottom:1px solid #222236}',
+      '#mufy-wb-editor{flex:1;width:100%;background:#1b1b28;color:#e6e6ef;border:1px solid #333350;border-radius:8px;padding:14px;font-size:14px;line-height:1.85;resize:none;box-sizing:border-box;font-family:inherit;outline:none}',
+      '#mufy-wb-editor:focus{border-color:#8b5cf6}',
+
+      '#mufy-wb-right{width:200px;min-width:200px;border-left:1px solid #222236;padding:16px 14px;overflow-y:auto;background:#161622;flex-shrink:0;display:flex;flex-direction:column;gap:14px}',
+      '.wb-info-block{}',
+      '.wb-info-title{font-size:11px;color:#5a5a7a;margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em}',
+      '.wb-info-block > div:last-child{font-size:14px;color:#c4b5fd;font-weight:500}',
+      '.wb-info-note{font-size:11px;color:#4a4a62;line-height:1.6;margin-top:auto}'
     ].join('');
 
     document.head.appendChild(style);
   }
+
+  /* ─── 字段列表渲染 ─── */
 
   function renderList() {
     if (!listEl) return;
@@ -879,7 +1125,7 @@
 
           renderList();
 
-          toast('“' + field.label + '”本次重绑成功');
+          toast('"' + field.label + '"本次重绑成功');
         });
       });
 
@@ -900,6 +1146,8 @@
     });
   }
 
+  /* ─── 面板构建 ─── */
+
   function buildPanel() {
     panelEl = document.createElement('div');
 
@@ -907,12 +1155,13 @@
 
     panelEl.innerHTML = [
       '<div id="mufy-helper-header">',
-      '<span>🧩 Mufy 字段助手 V0.2.2</span>',
+      '<span>🧩 Mufy 字段助手 V0.3.0</span>',
       '<span class="close">✕</span>',
       '</div>',
       '<div id="mufy-helper-toolbar">',
       '<button data-act="scan">扫描字段</button>',
       '<button data-act="copy">提取为 Markdown</button>',
+      '<button data-act="workbench">进入工作台</button>',
       '<button class="secondary" data-act="toggle-paste">粘贴 AI 结果</button>',
       '</div>',
       '<div id="mufy-helper-list"></div>',
@@ -987,6 +1236,24 @@
             : '复制失败，请手动选择文本复制'
         );
       });
+    });
+
+    /* 进入工作台 */
+    panelEl.querySelector('[data-act="workbench"]').addEventListener('click', function () {
+      if (!fields.length) {
+        scanFields();
+        renderList();
+      }
+
+      var unsafe = getUnsafeEnabledFields();
+
+      if (unsafe.length) {
+        toast('有 ' + unsafe.length + ' 个未确认字段已勾选，请先改名、重绑或取消勾选后再进入工作台');
+        return;
+      }
+
+      panelEl.classList.remove('open');
+      openWorkbench();
     });
 
     var pasteBox = panelEl.querySelector('#mufy-helper-paste');
@@ -1106,7 +1373,7 @@
 
       renderList();
 
-      toast('已写入 ' + count + ' 个字段；需要时可点“撤销本次写入”');
+      toast('已写入 ' + count + ' 个字段；需要时可点"撤销本次写入"');
     });
 
     panelEl.querySelector('#mufy-helper-cancel-preview').addEventListener('click', function () {
@@ -1130,14 +1397,7 @@
     );
   }
 
-  function escapeHtml(value) {
-    return asText(value)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
-  }
+  /* ─── 拖拽 ─── */
 
   function enableDrag(panel, handle) {
     var dragging = false;
@@ -1173,6 +1433,8 @@
     });
   }
 
+  /* ─── 悬浮按钮 ─── */
+
   function buildToggleButton() {
     var button = document.createElement('div');
 
@@ -1192,18 +1454,24 @@
     document.body.appendChild(button);
   }
 
+  /* ─── SPA 自修复 ─── */
+
   function ensureUI() {
     var toggle = document.getElementById('mufy-helper-toggle');
     var panel = document.getElementById('mufy-helper-panel');
+    var workbench = document.getElementById('mufy-workbench');
 
-    if (toggle && panel) return;
+    if (toggle && panel && workbench) return;
 
     if (toggle) toggle.remove();
     if (panel) panel.remove();
+    if (workbench) workbench.remove();
 
     panelEl = null;
     listEl = null;
+    wbEl = null;
 
+    buildWorkbench();
     buildPanel();
     buildToggleButton();
 
@@ -1211,6 +1479,8 @@
       renderList();
     }
   }
+
+  /* ─── 初始化 ─── */
 
   function init() {
     injectStyleOnce();
