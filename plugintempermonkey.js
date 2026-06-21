@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         白厨Mufy字段编辑器
 // @namespace    mufy-card-helper
-// @version      0.5.22
+// @version      0.5.24
 // @description  扫描、分组、导出、预览并安全写回 Mufy 角色卡编辑字段；含物品聚合工作台、三态草稿层与安全单字段注入
 // @match        https://chat.mufy.ai/create*
 // @grant        none
@@ -11,6 +11,18 @@
   'use strict';
 
   /*
+    V0.5.24 编辑体验修正
+    - 删除章节分段轨道，减少编辑区干扰。
+    - 查找结果改为黄色当前命中高亮，并自动滚动定位。
+    - 修复 Markdown 预览的 H1/H2/H3 层级，使其随正文设置保持明确字号、间距与视觉区分。
+
+    V0.5.23 工作台写卡工具包
+    - 新增 {}、$、{{user}}、{{char}} 快捷插入。
+    - 新增加粗、H1、H2、H3、分隔线与 Markdown 代码块工具。
+    - 新增当前字段 / 当前交互文案内的查找与替换。
+    - 新增编辑器右侧 Markdown 章节标记轨道，以颜色区分标题与分隔线。
+    - 所有编辑工具保持工作台草稿、光标、选区与滚动位置。
+
     V0.5.22 工作台编辑位置记忆
     - 普通字段记住工作台内的滚动位置与光标选区。
     - 交互提示词和每条使用后文案分别记住滚动位置与光标选区。
@@ -152,6 +164,14 @@
   var wbFocusMode = false;
   var wbSearchText = '';            // 左栏搜索框当前文字
   var wbCurrentInteractionEditorTarget = null;  // { kind: 'prompt' | 'afterCopywriting', copywritingIndex: number | null }
+  var wbFindState = {
+    open: false,
+    replace: false,
+    query: '',
+    replacement: '',
+    matches: [],
+    index: -1
+  };
 
   // UI 偏好（持久化至 localStorage）
   var UI_PREFS_KEY = 'whitechef-mufy-editor:ui-layout:v1';
@@ -192,7 +212,15 @@
 
   function applyEditorFontSize() {
     if (wbEl) {
-      wbEl.style.setProperty('--wb-editor-font-size', uiPrefs.editorFontSize + 'px');
+      var base = uiPrefs.editorFontSize;
+      var h1 = Math.max(23, Math.min(32, base + 10));
+      var h2 = Math.max(19, Math.min(28, base + 6));
+      var h3 = Math.max(16, Math.min(24, base + 3));
+      wbEl.style.setProperty('--wb-editor-font-size', base + 'px');
+      wbEl.style.setProperty('--wb-preview-body-size', base + 'px');
+      wbEl.style.setProperty('--wb-preview-h1-size', h1 + 'px');
+      wbEl.style.setProperty('--wb-preview-h2-size', h2 + 'px');
+      wbEl.style.setProperty('--wb-preview-h3-size', h3 + 'px');
     }
   }
 
@@ -462,6 +490,287 @@
     flushIxnEditorToDraft(snap);
     setIxnTargetViewState(snap, wbCurrentInteractionEditorTarget, readEditorViewState(editor));
     ensureIxnEditorViewState(snap).activeTarget = cloneIxnEditorTarget(wbCurrentInteractionEditorTarget);
+  }
+
+  function getActiveWorkbenchEditor() {
+    if (!wbEl || !wbEl.classList.contains('open')) return null;
+    if (wbCurrentInteraction) {
+      var ixnEditor = wbEl.querySelector('#mufy-ixn-main-editor');
+      if (ixnEditor && ixnEditor.style.display !== 'none') return { editor: ixnEditor, type: 'interaction' };
+    }
+    var editor = wbEl.querySelector('#mufy-wb-editor');
+    if (editor && editor.style.display !== 'none') return { editor: editor, type: 'normal' };
+    return null;
+  }
+
+  function syncActiveEditorDraft() {
+    var active = getActiveWorkbenchEditor();
+    if (!active) return;
+    if (active.type === 'interaction') {
+      var ixnSnap = getCurrentIxnSnap();
+      if (!ixnSnap) return;
+      flushIxnEditorToDraft(ixnSnap);
+      setIxnTargetViewState(ixnSnap, wbCurrentInteractionEditorTarget, readEditorViewState(active.editor));
+      markIxnDirty(ixnSnap);
+      return;
+    }
+    if (wbCurrentIndex < 0 || wbCurrentIndex >= wbSnapshot.length) return;
+    var snap = wbSnapshot[wbCurrentIndex];
+    snap.draftContent = active.editor.value;
+    snap.viewState = readEditorViewState(active.editor);
+    clearWbUndoForField(snap.fieldId);
+    if (snap.draftContent !== snap.syncedContent) {
+      if (snap.syncStatus !== 'dirty') {
+        snap.syncStatus = 'dirty';
+        renderWbFieldList();
+      }
+    } else if (snap.syncStatus === 'dirty') {
+      snap.syncStatus = 'clean';
+      setWbWriteStatus('', '');
+      renderWbFieldList();
+    }
+    scheduleWbRightPanelUpdate();
+    updateWbWriteControls();
+  }
+
+  function replaceEditorSelection(editor, nextValue, start, end) {
+    editor.value = nextValue;
+    editor.focus();
+    editor.setSelectionRange(Math.max(0, start), Math.max(0, end));
+  }
+
+  function applyTextEditOperation(editor, operation) {
+    if (!editor || !operation) return;
+    var scrollTop = editor.scrollTop;
+    var value = editor.value;
+    var start = editor.selectionStart || 0;
+    var end = editor.selectionEnd || start;
+    var selected = value.slice(start, end);
+    var before = value.slice(0, start);
+    var after = value.slice(end);
+    var nextValue = value;
+    var nextStart = start;
+    var nextEnd = start;
+
+    if (operation.type === 'wrap') {
+      nextValue = before + operation.open + selected + operation.close + after;
+      if (selected) {
+        nextStart = start + operation.open.length;
+        nextEnd = nextStart + selected.length;
+      } else {
+        nextStart = nextEnd = start + operation.open.length;
+      }
+    } else if (operation.type === 'insert') {
+      nextValue = before + operation.text + after;
+      nextStart = nextEnd = start + operation.text.length;
+    } else if (operation.type === 'heading') {
+      var lineStart = value.lastIndexOf('\n', start - 1) + 1;
+      var lineEndPos = value.indexOf('\n', start);
+      if (lineEndPos === -1) lineEndPos = value.length;
+      var line = value.slice(lineStart, lineEndPos);
+      var cleanLine = line.replace(/^#{1,6}\s*/, '');
+      var prefix = new Array(operation.level + 1).join('#') + ' ';
+      var nextLine = prefix + cleanLine;
+      nextValue = value.slice(0, lineStart) + nextLine + value.slice(lineEndPos);
+      var delta = nextLine.length - line.length;
+      nextStart = Math.max(lineStart + prefix.length, start + delta);
+      nextEnd = Math.max(nextStart, end + delta);
+    } else if (operation.type === 'divider') {
+      var insertAt = start;
+      var left = value.slice(0, insertAt).replace(/\n{0,2}$/, '\n\n');
+      var right = value.slice(end).replace(/^\n{0,2}/, '\n\n');
+      var divider = '---';
+      nextValue = left + divider + right;
+      nextStart = nextEnd = left.length + divider.length;
+    } else if (operation.type === 'codeblock') {
+      if (selected) {
+        var block = '```\n\n' + selected + '\n\n```';
+        nextValue = before + block + after;
+        nextStart = start + 5;
+        nextEnd = nextStart + selected.length;
+      } else {
+        var emptyBlock = '```\n\n```';
+        nextValue = before + emptyBlock + after;
+        nextStart = nextEnd = start + 4;
+      }
+    }
+
+    replaceEditorSelection(editor, nextValue, nextStart, nextEnd);
+    editor.scrollTop = scrollTop;
+    syncActiveEditorDraft();
+    updateFindMatches(true, true);
+  }
+
+  function getActiveFindPanel() {
+    if (!wbEl) return null;
+    return wbCurrentInteraction ? wbEl.querySelector('#mufy-ixn-find-panel') : wbEl.querySelector('#mufy-wb-find-panel');
+  }
+
+  function buildWorkbenchToolRows() {
+    if (!wbEl) return;
+    var rows = [wbEl.querySelector('#mufy-wb-tool-row'), wbEl.querySelector('#mufy-ixn-tool-row')];
+    var html = [
+      '<button type="button" data-tool="braces" title="插入花括号">{}</button>',
+      '<button type="button" data-tool="dollar" title="插入美元符号">$</button>',
+      '<button type="button" data-tool="user" title="插入用户变量">{{user}}</button>',
+      '<button type="button" data-tool="char" title="插入角色变量">{{char}}</button>',
+      '<span class="mufy-tool-sep"></span>',
+      '<button type="button" data-tool="bold" title="加粗 Markdown"><strong>B</strong></button>',
+      '<button type="button" data-tool="h1" title="一级标题">H1</button>',
+      '<button type="button" data-tool="h2" title="二级标题">H2</button>',
+      '<button type="button" data-tool="h3" title="三级标题">H3</button>',
+      '<button type="button" data-tool="divider" title="插入 Markdown 分隔线">分隔</button>',
+      '<button type="button" data-tool="codeblock" title="插入 Markdown 代码块">代码块</button>',
+      '<span class="mufy-tool-sep"></span>',
+      '<button type="button" data-tool="find" title="查找当前内容">⌕ 查找</button>'
+    ].join('');
+    rows.forEach(function (row) {
+      if (row) row.innerHTML = html;
+    });
+  }
+
+  function buildFindPanels() {
+    if (!wbEl) return;
+    var panels = [wbEl.querySelector('#mufy-wb-find-panel'), wbEl.querySelector('#mufy-ixn-find-panel')];
+    var html = [
+      '<div class="mufy-find-line">',
+      '  <label>查找:<input class="mufy-find-query" type="text" autocomplete="off"></label>',
+      '  <button type="button" data-find-act="prev">上一个</button>',
+      '  <button type="button" data-find-act="next">下一个</button>',
+      '  <span class="mufy-find-count">0 / 0</span>',
+      '</div>',
+      '<div class="mufy-find-line mufy-replace-line">',
+      '  <label>替换为:<input class="mufy-find-replace" type="text" autocomplete="off"></label>',
+      '  <button type="button" data-find-act="replace-current">替换当前</button>',
+      '  <button type="button" data-find-act="replace-all">全部替换</button>',
+      '</div>'
+    ].join('');
+    panels.forEach(function (panel) {
+      if (panel) panel.innerHTML = html;
+    });
+  }
+
+  function setWorkbenchEditorModeToEdit() {
+    if (wbCurrentInteraction) setIxnEditorMode('edit');
+    else setNormalEditorMode('edit');
+  }
+
+  function openWorkbenchFind(replaceMode) {
+    setWorkbenchEditorModeToEdit();
+    wbFindState.open = true;
+    wbFindState.replace = !!replaceMode;
+    var panel = getActiveFindPanel();
+    if (!panel) return;
+    panel.style.display = '';
+    panel.classList.toggle('replace-open', !!replaceMode);
+    var q = panel.querySelector('.mufy-find-query');
+    var r = panel.querySelector('.mufy-find-replace');
+    if (q) {
+      q.value = wbFindState.query;
+      q.focus();
+      q.select();
+    }
+    if (r) r.value = wbFindState.replacement;
+    updateFindMatches(false, false);
+  }
+
+  function closeWorkbenchFind() {
+    wbFindState.open = false;
+    var panels = [wbEl && wbEl.querySelector('#mufy-wb-find-panel'), wbEl && wbEl.querySelector('#mufy-ixn-find-panel')];
+    panels.forEach(function (panel) {
+      if (panel) panel.style.display = 'none';
+    });
+    var active = getActiveWorkbenchEditor();
+    if (active) active.editor.focus();
+  }
+
+  function findMatches(value, query) {
+    if (!query) return [];
+    var matches = [];
+    var haystack = value.toLowerCase();
+    var needle = query.toLowerCase();
+    var pos = 0;
+    while (needle && (pos = haystack.indexOf(needle, pos)) !== -1) {
+      matches.push({ start: pos, end: pos + query.length });
+      pos += Math.max(needle.length, 1);
+    }
+    return matches;
+  }
+
+  function updateFindCount() {
+    var panel = getActiveFindPanel();
+    if (!panel) return;
+    var count = panel.querySelector('.mufy-find-count');
+    var total = wbFindState.matches.length;
+    count.textContent = total ? ((wbFindState.index + 1) + ' / ' + total) : '0 / 0';
+  }
+
+  function selectFindMatch(index) {
+    var active = getActiveWorkbenchEditor();
+    if (!active || !wbFindState.matches.length) {
+      updateFindCount();
+      return;
+    }
+    var total = wbFindState.matches.length;
+    wbFindState.index = (index + total) % total;
+    var match = wbFindState.matches[wbFindState.index];
+    active.editor.focus();
+    active.editor.setSelectionRange(match.start, match.end);
+    saveActiveEditorViewStateOnly();
+    updateFindCount();
+  }
+
+  function saveActiveEditorViewStateOnly() {
+    var active = getActiveWorkbenchEditor();
+    if (!active) return;
+    if (active.type === 'interaction') {
+      var snap = getCurrentIxnSnap();
+      if (snap) setIxnTargetViewState(snap, wbCurrentInteractionEditorTarget, readEditorViewState(active.editor));
+    } else if (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) {
+      wbSnapshot[wbCurrentIndex].viewState = readEditorViewState(active.editor);
+    }
+  }
+
+  function updateFindMatches(keepIndex, shouldSelect) {
+    if (!wbFindState.open) return;
+    var active = getActiveWorkbenchEditor();
+    if (!active) return;
+    var oldIndex = wbFindState.index;
+    wbFindState.matches = findMatches(active.editor.value, wbFindState.query);
+    if (!wbFindState.matches.length) {
+      wbFindState.index = -1;
+      updateFindCount();
+      return;
+    }
+    wbFindState.index = keepIndex && oldIndex >= 0 ? Math.min(oldIndex, wbFindState.matches.length - 1) : 0;
+    if (shouldSelect) selectFindMatch(wbFindState.index);
+    else updateFindCount();
+  }
+
+  function replaceCurrentFindMatch() {
+    var active = getActiveWorkbenchEditor();
+    if (!active || !wbFindState.matches.length || wbFindState.index < 0) return;
+    var match = wbFindState.matches[wbFindState.index];
+    var value = active.editor.value;
+    active.editor.value = value.slice(0, match.start) + wbFindState.replacement + value.slice(match.end);
+    var caret = match.start + wbFindState.replacement.length;
+    active.editor.focus();
+    active.editor.setSelectionRange(caret, caret);
+    syncActiveEditorDraft();
+    updateFindMatches(true, true);
+  }
+
+  function replaceAllFindMatches() {
+    var active = getActiveWorkbenchEditor();
+    if (!active || !wbFindState.matches.length || !wbFindState.query) return;
+    var count = wbFindState.matches.length;
+    if (count > 1 && !window.confirm('将在当前内容中替换 ' + count + ' 处，是否继续？')) return;
+    var re = new RegExp(wbFindState.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    active.editor.value = active.editor.value.replace(re, wbFindState.replacement);
+    active.editor.focus();
+    active.editor.setSelectionRange(0, 0);
+    syncActiveEditorDraft();
+    updateFindMatches(false, true);
   }
 
   function normalizeTrackedLabel(label) {
@@ -1481,6 +1790,8 @@
       '      <button id="mufy-wb-mode-edit" class="wb-mode-btn active">编辑</button>',
       '      <button id="mufy-wb-mode-preview" class="wb-mode-btn">预览</button>',
       '    </div>',
+      '    <div id="mufy-wb-tool-row" class="mufy-wb-tool-row" data-editor="normal"></div>',
+      '    <div id="mufy-wb-find-panel" class="mufy-wb-find-panel" data-editor="normal" style="display:none"></div>',
       '    <textarea id="mufy-wb-editor" placeholder="从左侧选择一个字段…"></textarea>',
       '    <div id="mufy-wb-preview" class="wb-preview-pane" style="display:none"></div>',
       '    <div id="mufy-wb-action-bar">',
@@ -1500,6 +1811,8 @@
       '        <button id="mufy-ixn-mode-edit" class="wb-mode-btn active">编辑</button>',
       '        <button id="mufy-ixn-mode-preview" class="wb-mode-btn">预览</button>',
       '      </div>',
+      '      <div id="mufy-ixn-tool-row" class="mufy-wb-tool-row" data-editor="interaction"></div>',
+      '      <div id="mufy-ixn-find-panel" class="mufy-wb-find-panel" data-editor="interaction" style="display:none"></div>',
       '      <textarea id="mufy-ixn-main-editor" class="mufy-ixn-main-textarea" placeholder="选择上方 tab 开始编辑…"></textarea>',
       '      <div id="mufy-ixn-preview" class="wb-preview-pane" style="display:none"></div>',
       '      <div class="mufy-ixn-field-group mufy-ixn-action-row">',
@@ -1566,6 +1879,8 @@
     ].join('');
 
     document.body.appendChild(wbEl);
+    buildWorkbenchToolRows();
+    buildFindPanels();
 
     /* 收起工作台（只隐藏，不清空草稿，不跳转路由） */
     wbEl.querySelector('#mufy-wb-return').addEventListener('click', function () {
@@ -1796,6 +2111,48 @@
       setIxnEditorMode('preview');
     });
 
+    wbEl.addEventListener('click', function (event) {
+      var tool = event.target.closest('.mufy-wb-tool-row button[data-tool]');
+      if (tool) {
+        var active = getActiveWorkbenchEditor();
+        if (!active) return;
+        var name = tool.dataset.tool;
+        if (name === 'find') { openWorkbenchFind(false); return; }
+        var ops = {
+          braces: { type: 'wrap', open: '{', close: '}' },
+          dollar: { type: 'insert', text: '$' },
+          user: { type: 'insert', text: '{{user}}' },
+          char: { type: 'insert', text: '{{char}}' },
+          bold: { type: 'wrap', open: '**', close: '**' },
+          h1: { type: 'heading', level: 1 },
+          h2: { type: 'heading', level: 2 },
+          h3: { type: 'heading', level: 3 },
+          divider: { type: 'divider' },
+          codeblock: { type: 'codeblock' }
+        };
+        applyTextEditOperation(active.editor, ops[name]);
+        return;
+      }
+
+      var findAct = event.target.closest('.mufy-wb-find-panel button[data-find-act]');
+      if (findAct) {
+        var act = findAct.dataset.findAct;
+        if (act === 'prev') selectFindMatch(wbFindState.index - 1);
+        else if (act === 'next') selectFindMatch(wbFindState.index + 1);
+        else if (act === 'replace-current') replaceCurrentFindMatch();
+        else if (act === 'replace-all') replaceAllFindMatches();
+      }
+    });
+
+    wbEl.addEventListener('input', function (event) {
+      if (event.target.classList && event.target.classList.contains('mufy-find-query')) {
+        wbFindState.query = event.target.value;
+        updateFindMatches(false, false);
+      } else if (event.target.classList && event.target.classList.contains('mufy-find-replace')) {
+        wbFindState.replacement = event.target.value;
+      }
+    });
+
     /* 左栏拖拽手柄 */
     (function () {
       var handle = wbEl.querySelector('#mufy-wb-left-handle');
@@ -1850,7 +2207,24 @@
 
     /* Esc：优先关闭帮助弹窗，其次退出专注模式，不关工作台 */
     wbEl.addEventListener('keydown', function (event) {
+      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'f') {
+        event.preventDefault();
+        event.stopPropagation();
+        openWorkbenchFind(false);
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'h') {
+        event.preventDefault();
+        event.stopPropagation();
+        openWorkbenchFind(true);
+        return;
+      }
       if (event.key !== 'Escape') return;
+      if (wbFindState.open) {
+        event.stopPropagation();
+        closeWorkbenchFind();
+        return;
+      }
       if (document.getElementById('mufy-guide-modal')) {
         event.stopPropagation();
         closeGuideModal();
@@ -2316,17 +2690,20 @@
     var previewEl = wbEl.querySelector('#mufy-wb-preview');
     var editBtn = wbEl.querySelector('#mufy-wb-mode-edit');
     var prevBtn = wbEl.querySelector('#mufy-wb-mode-preview');
+    var toolRow = wbEl.querySelector('#mufy-wb-tool-row');
     if (!editorEl || !previewEl) return;
     if (mode === 'preview') {
       saveNormalEditorSessionState();
       var snap = (wbCurrentIndex >= 0 && wbCurrentIndex < wbSnapshot.length) ? wbSnapshot[wbCurrentIndex] : null;
       renderSafeMarkdown(snap ? snap.draftContent : editorEl.value, previewEl);
       editorEl.style.display = 'none';
+      if (toolRow) toolRow.style.display = 'none';
       previewEl.style.display = '';
       if (editBtn) editBtn.classList.remove('active');
       if (prevBtn) prevBtn.classList.add('active');
     } else {
       editorEl.style.display = '';
+      if (toolRow) toolRow.style.display = '';
       previewEl.style.display = 'none';
       if (editBtn) editBtn.classList.add('active');
       if (prevBtn) prevBtn.classList.remove('active');
@@ -2343,16 +2720,19 @@
     var previewEl = wbEl.querySelector('#mufy-ixn-preview');
     var editBtn = wbEl.querySelector('#mufy-ixn-mode-edit');
     var prevBtn = wbEl.querySelector('#mufy-ixn-mode-preview');
+    var toolRow = wbEl.querySelector('#mufy-ixn-tool-row');
     if (!editorEl || !previewEl) return;
     if (mode === 'preview') {
       saveCurrentIxnEditorSessionState();
       renderSafeMarkdown(editorEl.value, previewEl);
       editorEl.style.display = 'none';
+      if (toolRow) toolRow.style.display = 'none';
       previewEl.style.display = '';
       if (editBtn) editBtn.classList.remove('active');
       if (prevBtn) prevBtn.classList.add('active');
     } else {
       editorEl.style.display = '';
+      if (toolRow) toolRow.style.display = '';
       previewEl.style.display = 'none';
       if (editBtn) editBtn.classList.add('active');
       if (prevBtn) prevBtn.classList.remove('active');
@@ -2588,6 +2968,10 @@
     if (editorEl) editorEl.style.display = '';
     if (previewEl) previewEl.style.display = 'none';
     if (editorBar) editorBar.style.display = '';
+    var normalToolRow = wbEl.querySelector('#mufy-wb-tool-row');
+    var normalFindPanel = wbEl.querySelector('#mufy-wb-find-panel');
+    if (normalToolRow) normalToolRow.style.display = '';
+    if (normalFindPanel && wbFindState.open) normalFindPanel.style.display = '';
     var editBtn = wbEl.querySelector('#mufy-wb-mode-edit');
     var prevBtn = wbEl.querySelector('#mufy-wb-mode-preview');
     if (editBtn) editBtn.classList.add('active');
@@ -2792,6 +3176,8 @@
     var ixnPrevBtn = form.querySelector('#mufy-ixn-mode-preview');
     if (ixnEditorEl) ixnEditorEl.style.display = '';
     if (ixnPreviewEl) ixnPreviewEl.style.display = 'none';
+    var ixnToolRow = form.querySelector('#mufy-ixn-tool-row');
+    if (ixnToolRow) ixnToolRow.style.display = '';
     if (ixnEditBtn) ixnEditBtn.classList.add('active');
     if (ixnPrevBtn) ixnPrevBtn.classList.remove('active');
 
@@ -3451,7 +3837,8 @@
       '.mufy-wb-field-item.active{background:#28194a;color:#c4b5fd;border-left:3px solid #8b5cf6;padding-left:9px}',
       '.mufy-wb-dot{width:7px;height:7px;min-width:7px;border-radius:50%;display:inline-block}',
 
-      '#mufy-wb-center{flex:1;display:flex;flex-direction:column;padding:12px 16px 12px;gap:8px;overflow:hidden}',
+      '#mufy-wb-center{flex:1;display:flex;flex-direction:column;padding:12px 16px 12px;gap:8px;overflow:hidden;position:relative}',
+      '#mufy-wb-interaction-form{position:relative}',
       '#mufy-wb-editor{flex:1;width:100%;background:#1b1b28;color:#e6e6ef;border:1px solid #333350;border-radius:8px;padding:14px;font-size:var(--wb-editor-font-size,15px);line-height:1.85;resize:none;box-sizing:border-box;font-family:inherit;outline:none}',
       '#mufy-wb-editor:focus{border-color:#8b5cf6}',
       '#mufy-wb-action-bar{display:flex;align-items:center;gap:8px;flex-shrink:0}',
@@ -3588,11 +3975,28 @@
       '.wb-mode-btn{background:#272540;border:none;color:#9e96d5;border-radius:5px;padding:4px 12px;font-size:12px;cursor:pointer}',
       '.wb-mode-btn.active{background:#5a35ab;color:#fff}',
       '.wb-mode-btn:hover:not(.active){background:#333254;color:#d9d3ff}',
+      '.mufy-wb-tool-row{display:flex;align-items:center;gap:4px;flex-wrap:wrap;flex-shrink:0}',
+      '.mufy-wb-tool-row button{background:#24243a;border:1px solid #343452;color:#d7d2ef;border-radius:5px;padding:3px 8px;font-size:12px;cursor:pointer;line-height:1.45}',
+      '.mufy-wb-tool-row button:hover{background:#302d4e;border-color:#6d4bc2;color:#fff}',
+      '.mufy-tool-sep{width:1px;height:18px;background:#343452;margin:0 3px}',
+      '.mufy-wb-find-panel{border:1px solid #302d48;background:#181827;border-radius:6px;padding:7px 8px;flex-shrink:0}',
+      '.mufy-find-line{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;color:#aaa5c9}',
+      '.mufy-find-line+.mufy-find-line{margin-top:6px}',
+      '.mufy-wb-find-panel:not(.replace-open) .mufy-replace-line{display:none}',
+      '.mufy-find-line label{display:flex;align-items:center;gap:5px}',
+      '.mufy-find-line input{width:150px;background:#242438;border:1px solid #3b3b56;border-radius:4px;color:#fff;padding:3px 6px;font-size:12px}',
+      '.mufy-find-line button{background:#2d2b45;border:none;color:#d7d2ef;border-radius:4px;padding:3px 7px;font-size:11px;cursor:pointer}',
+      '.mufy-find-count{min-width:42px;color:#c4b5fd;text-align:right}',
+      '#mufy-wb-editor::selection,#mufy-ixn-main-editor::selection{background:#facc15;color:#111827}',
 
       /* ── Markdown 预览面板 ── */
-      '.wb-preview-pane{flex:1;min-height:0;overflow-y:auto;padding:14px;background:#1b1b28;border:1px solid #333350;border-radius:8px;box-sizing:border-box;color:#e6e6ef;font-size:var(--wb-editor-font-size,15px);line-height:1.85}',
+      '.wb-preview-pane{flex:1;min-height:0;overflow-y:auto;padding:14px;background:#1b1b28;border:1px solid #333350;border-radius:8px;box-sizing:border-box;color:#e6e6ef;font-size:var(--wb-preview-body-size,var(--wb-editor-font-size,15px));line-height:1.85}',
       '.wb-preview-pane p{margin:0 0 8px}',
-      '.wb-preview-pane h1,.wb-preview-pane h2,.wb-preview-pane h3,.wb-preview-pane h4{margin:10px 0 4px;color:#c4b5fd}',
+      '.wb-preview-pane h1,.wb-preview-pane h2,.wb-preview-pane h3,.wb-preview-pane h4{line-height:1.35;color:#c4b5fd}',
+      '.wb-preview-pane h1{font-size:var(--wb-preview-h1-size,25px);font-weight:700;color:#ddd6fe;margin:22px 0 10px;padding-bottom:7px;border-bottom:1px solid #373052}',
+      '.wb-preview-pane h2{font-size:var(--wb-preview-h2-size,21px);font-weight:650;color:#b4a5ff;margin:18px 0 8px}',
+      '.wb-preview-pane h3{font-size:var(--wb-preview-h3-size,18px);font-weight:600;color:#c4b5fd;margin:14px 0 6px}',
+      '.wb-preview-pane h4{font-size:calc(var(--wb-preview-body-size,var(--wb-editor-font-size,15px)) + 1px);font-weight:600;margin:12px 0 5px;color:#c4b5fd}',
       '.wb-preview-pane code{background:#252240;padding:1px 5px;border-radius:3px;font-size:.9em;color:#e9d5ff}',
       '.wb-preview-pane pre{background:#1a1a30;border-radius:6px;padding:10px 12px;overflow-x:auto;margin:6px 0}',
       '.wb-preview-pane pre code{background:none;padding:0}',
@@ -3967,7 +4371,7 @@
     if (!listEl) return;
 
     var title = panelEl ? panelEl.querySelector('#mufy-helper-header span') : null;
-    if (title) title.textContent = '🧩 白厨Mufy字段编辑器 V0.5.22';
+    if (title) title.textContent = '🧩 白厨Mufy字段编辑器 V0.5.24';
 
     listEl.innerHTML = '';
 
@@ -4022,7 +4426,7 @@
     panelEl.id = 'mufy-helper-panel';
     panelEl.innerHTML = [
       '<div id="mufy-helper-header">',
-      '<span class="mufy-panel-title">白厨Mufy字段编辑器 V0.5.22</span>',
+      '<span class="mufy-panel-title">白厨Mufy字段编辑器 V0.5.24</span>',
       '<button class="mufy-panel-help-btn" id="mufy-panel-help" title="帮助">?</button>',
       '<span class="close">✕</span>',
       '</div>',
